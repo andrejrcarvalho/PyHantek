@@ -130,7 +130,20 @@ def decode_uart(
     _, falling = _edges(d)
     n_par = 0 if parity == "None" else 1
     frame_bits = 1 + data_bits + n_par + stop_bits
+    # A capture can begin in the middle of a byte. Sync like a real receiver: start after the line
+    # has been idle (high) for a whole frame. If it never idles (back-to-back data), start at once.
     pos = 0.0
+    rising, _ = _edges(d)
+    if d[0] == 1 and (falling.size == 0 or falling[0] >= frame_bits * spb):
+        pos = 0.0  # already idle at the start
+    else:
+        for r in rising:
+            nxt = falling[falling > r]
+            end_of_idle = nxt[0] if nxt.size else n
+            if end_of_idle - r >= frame_bits * spb:
+                if nxt.size:  # data follows the idle gap: sync there
+                    pos = float(r)
+                break  # idle only at the very end: nothing to sync to, decode from the start
     i = 0
     while i < falling.size:
         s = falling[i]

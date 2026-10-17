@@ -113,3 +113,15 @@ def test_channel_needed_for_decoder_and_xy():
     s.decoder.enabled = False
     s.xy_mode = True
     assert s.channel_needed(1)
+
+
+def test_uart_resyncs_when_capture_starts_mid_byte():
+    sr = 1e6
+    v = dec.synth_uart(b"\xa5\x5aOK", 9600, sr, idle_bits=12)
+    spb = sr / 9600
+    # cut inside the first byte, then add a long idle gap and a clean message
+    tail = dec.synth_uart(b"Hi", 9600, sr, idle_bits=12)
+    v = np.concatenate((v[int(14 * spb):], tail))
+    r = dec.decode_uart(v, sr, baud=9600, fmt="ASCII")
+    assert "".join(a.text for a in r.annotations).endswith("Hi")
+    assert all(a.kind == "data" for a in r.annotations)

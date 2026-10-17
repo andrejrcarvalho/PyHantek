@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=PyHantek
+GenericName=Oscilloscope
+Comment=Oscilloscope app for Hantek DSO-6022 USB scopes
+Exec=pyhantek %U
+Icon=pyhantek
+Terminal=false
+Categories=Science;Electronics;Engineering;
+Keywords=oscilloscope;scope;hantek;6022;measurement;
+StartupWMClass=pyhantek

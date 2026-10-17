@@ -17,6 +17,18 @@ uv run pyhantek -vv        # debug logging
 
 Run the tests with `uv run pytest`.
 
+### Standalone builds
+
+| Platform | File | How to build |
+| --- | --- | --- |
+| Linux (x86-64) | `dist/PyHantek-<version>-x86_64.AppImage` | `./packaging/build_appimage.sh` |
+| Windows (x64) | `dist\PyHantek-<version>-windows-x64.exe` | `powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1` (run on Windows) |
+
+PyInstaller can't cross-compile, so the `.exe` has to be built on Windows. The GitHub Actions workflow (`.github/workflows/build.yml`) builds both files on every push. When you push a `v*` tag, it attaches them to a GitHub release.
+
+To run the AppImage: `chmod +x PyHantek-*.AppImage && ./PyHantek-*.AppImage`. It needs a distro with a glibc at least as new as the build machine's (Ubuntu 22.04 for CI builds). For USB access, install the udev rule once:
+`./PyHantek-*.AppImage --udev-rules | sudo tee /etc/udev/rules.d/60-openhantek.rules && sudo udevadm control --reload`
+
 ### USB access
 
 * **Linux:** install the udev rule and replug the scope:

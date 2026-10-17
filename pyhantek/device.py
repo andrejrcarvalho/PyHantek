@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import array
 import logging
+import os
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -50,13 +52,32 @@ class DeviceGone(DeviceError):
     """The scope was unplugged."""
 
 
-def _backend():
-    try:
-        import libusb_package  # bundled libusb DLL on Windows / macOS
+_BACKEND = None
 
-        return libusb_package.get_libusb1_backend()
+
+def _backend():
+    """libusb backend: the libusb-package DLL (Windows/macOS), a copy bundled in a frozen app, or the system one."""
+    global _BACKEND
+    if _BACKEND is not None:
+        return _BACKEND
+    try:
+        import libusb_package
+
+        _BACKEND = libusb_package.get_libusb1_backend()
+        if _BACKEND is not None:
+            return _BACKEND
     except Exception:
-        return None
+        pass
+    base = getattr(sys, "_MEIPASS", None)  # PyInstaller bundle
+    if base:
+        for name in ("libusb-1.0.so.0", "libusb-1.0.dll", "libusb-1.0.dylib"):
+            path = os.path.join(base, name)
+            if os.path.exists(path):
+                import usb.backend.libusb1 as libusb1
+
+                _BACKEND = libusb1.get_backend(find_library=lambda _name, p=path: p)
+                return _BACKEND
+    return None
 
 
 def _usb():

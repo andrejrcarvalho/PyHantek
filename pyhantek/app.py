@@ -84,8 +84,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--mcp-port", type=int, default=None, help="port of the built-in MCP server (default 8765)")
     ap.add_argument("--mcp-host", default="127.0.0.1", help="interface for the MCP server (default 127.0.0.1)")
     ap.add_argument("--no-mcp", action="store_true", help="start with the MCP server switched off")
+    ap.add_argument("--udev-rules", action="store_true",
+                    help="print the Linux udev rule for USB access (pipe into: sudo tee /etc/udev/rules.d/60-openhantek.rules)")
     ap.add_argument("--version", action="version", version=f"pyhantek {__version__}")
     args = ap.parse_args(argv)
+    if args.udev_rules:
+        from importlib import resources
+
+        sys.stdout.write(resources.files("pyhantek.assets").joinpath("60-openhantek.rules").read_text())
+        return 0
+    # windowed builds (PyInstaller --noconsole) have no stdout/stderr; logging and uvicorn need them
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name) is None:
+            setattr(sys, name, open(os.devnull, "w"))
     logging.basicConfig(level=[logging.WARNING, logging.INFO, logging.DEBUG][min(args.verbose, 2)],
                         format="%(levelname)s %(name)s: %(message)s")
 
@@ -93,6 +104,12 @@ def main(argv: list[str] | None = None) -> int:
     # PYHANTEK_PROFILE keeps separate saved settings (used by tests)
     QCoreApplication.setApplicationName("pyhantek" + (f"-{os.environ['PYHANTEK_PROFILE']}" if os.environ.get("PYHANTEK_PROFILE") else ""))
     app = QApplication(sys.argv[:1])
+    app.setDesktopFileName("pyhantek")
+    from importlib import resources
+
+    from PySide6.QtGui import QIcon
+
+    app.setWindowIcon(QIcon(str(resources.files("pyhantek.assets").joinpath("pyhantek.png"))))
     from .ui import theme
     from .ui.mainwindow import MainWindow
 
