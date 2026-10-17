@@ -55,6 +55,28 @@ The firmware is uploaded automatically when the scope is plugged in. Outdated fi
 | Mouse wheel / Shift + wheel | Timebase / V/div |
 | Ctrl+P / Ctrl+E | Screenshot / CSV export |
 
+## AI control (MCP)
+
+The app has a built-in [MCP](https://modelcontextprotocol.io) server, so assistants such as Claude can operate the scope. It listens on `http://127.0.0.1:8765/mcp` (localhost only), and the **MCP** toolbar button switches it on and off. The status bar shows whether it is running.
+
+```sh
+claude mcp add --transport http --scope user pyhantek http://127.0.0.1:8765/mcp
+```
+
+| Tool | What it does |
+| --- | --- |
+| `get_status` | Device, run state, sample rate, all settings and valid ranges |
+| `set_channel` / `set_horizontal` / `set_trigger` / `set_math` / `set_display` | Change settings (values snap to valid 1-2-5 steps) |
+| `run` / `stop` / `single` / `autoset` | Acquisition control |
+| `get_measurements` | Frequency, Vpp, RMS, duty cycle, rise time… for each trace |
+| `get_waveform` | Time/voltage samples of the screen or the whole record |
+| `get_spectrum` | FFT peaks, noise floor and THD |
+| `screenshot` | PNG of the scope screen |
+
+Measurement tools wait for a frame captured with the latest settings, so "change something, then measure" never returns stale data.
+
+Options: `--mcp-port 9000`, `--mcp-host 0.0.0.0` (to reach the app from another machine or from WSL; this exposes the scope to your network), and `--no-mcp`.
+
 ## Layout
 
 ```
@@ -65,6 +87,7 @@ pyhantek/
   acquisition.py   capture thread: hardware setup, conversion to volts, trigger, roll mode
   processing.py    trigger search, measurements, FFT, math, decimation
   settings.py      user settings (JSON)
+  mcp_server.py    built-in MCP server (AI control over localhost HTTP)
   ui/              theme, scope and spectrum views, control panel, main window
   firmware/        FX2 firmware (from Hantek6022API)
 ```

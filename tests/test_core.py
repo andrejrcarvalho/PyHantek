@@ -156,3 +156,12 @@ def test_minmax_decimate_keeps_ends_and_peaks():
     xd, yd = minmax_decimate(x, y, 1500)
     assert len(xd) <= 3002
     assert xd[-1] == x[-1] and yd.min() == -3.0 and yd.max() == 7.0
+
+
+def test_frequency_with_two_periods_on_screen():
+    sr = 1e6
+    for phase in np.linspace(0, 1, 7, endpoint=False):
+        t = np.arange(2000) / sr  # exactly two periods of 1 kHz
+        x = np.sin(2 * np.pi * (1000 * t + phase))
+        m = measure(x, sr)
+        assert m.freq == pytest.approx(1000, rel=0.01), phase

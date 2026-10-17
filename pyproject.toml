@@ -11,6 +11,7 @@ dependencies = [
     "pyusb>=1.2.1",
     "numpy>=1.26",
     "libusb-package>=1.0.26; sys_platform == 'win32' or sys_platform == 'darwin'",
+    "mcp>=2.3",
 ]
 
 [project.scripts]

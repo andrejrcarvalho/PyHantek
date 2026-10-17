@@ -1,0 +1,609 @@
+"""MCP server that lets AI assistants operate the scope.
+
+Runs Streamable HTTP on localhost inside the app. Every tool executes its
+work on the Qt GUI thread, so it sees exactly what the user sees.
+
+Connect Claude Code with:
+    claude mcp add --transport http pyhantek http://127.0.0.1:8765/mcp
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import math
+import socket
+import threading
+from concurrent.futures import Future
+from dataclasses import asdict
+from typing import Any, Callable, Literal
+
+import numpy as np
+from mcp.server.mcpserver import Image, MCPServer
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QObject, Qt, Signal
+
+from .processing import math_channel, measure, spectrum
+from .settings import INTERPOLATIONS, MATH_MODES, NOISE_REJECT, PROBES, TIMEBASES, VDIVS, WINDOWS
+
+log = logging.getLogger(__name__)
+
+DEFAULT_PORT = 8765
+
+INSTRUCTIONS = """\
+Controls a live Hantek DSO-6022-family USB oscilloscope (2 channels, 8-bit, up to 30 MS/s)
+running in the PyHantek app. All values use SI base units: seconds, volts, hertz.
+The screen is 10 horizontal divisions by 8 vertical divisions.
+Typical flow: get_status -> configure with set_channel / set_horizontal / set_trigger (or autoset)
+-> get_measurements / get_waveform / get_spectrum / screenshot.
+Settings snap to the nearest valid value (1-2-5 steps) and the applied value is returned.
+Measurement tools wait for a frame captured with the latest settings.
+In Normal or Single trigger mode no frame arrives until the signal crosses the trigger level.
+The scope's calibration output (CAL pin) is a square wave whose frequency is set with set_horizontal(calfreq=...).
+"""
+
+
+class GuiBridge(QObject):
+    """Runs callables on the Qt GUI thread and hands back a Future."""
+
+    _call = Signal(object)
+
+    def __init__(self):
+        super().__init__()
+        self._call.connect(self._run, Qt.QueuedConnection)
+
+    def _run(self, job):
+        fn, fut = job
+        if not fut.set_running_or_notify_cancel():
+            return
+        try:
+            fut.set_result(fn())
+        except BaseException as exc:  # forwarded to the waiting tool call
+            fut.set_exception(exc)
+
+    def submit(self, fn: Callable[[], Any]) -> Future:
+        fut: Future = Future()
+        self._call.emit((fn, fut))
+        return fut
+
+
+def _num(v, digits=6):
+    """JSON-safe rounded number (None for NaN/inf)."""
+    if v is None:
+        return None
+    v = float(v)
+    if not math.isfinite(v):
+        return None
+    return float(f"{v:.{digits}g}")
+
+
+def _nearest(values, v):
+    return min(values, key=lambda x: abs(math.log(x / v)) if x > 0 and v > 0 else abs(x - v))
+
+
+CHANNEL = Literal["CH1", "CH2", "MATH"]
+
+
+class McpServer:
+    def __init__(self, window, host: str = "127.0.0.1", port: int = DEFAULT_PORT):
+        self.win = window
+        self.host = host
+        self.port = port
+        self.bridge = GuiBridge()
+        self._thread: threading.Thread | None = None
+        self._server = None
+        self.error = ""
+
+    @property
+    def url(self) -> str:
+        return f"http://{self.host}:{self.port}/mcp"
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    # ------------------------------------------------------------ lifecycle
+
+    def start(self) -> bool:
+        if self.running:
+            return True
+        self.error = ""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((self.host, self.port))
+        except OSError as exc:
+            self.error = f"port {self.port} unavailable ({exc.strerror or exc})"
+            log.warning("MCP server: %s", self.error)
+            return False
+        import uvicorn
+
+        try:
+            app = self._build().streamable_http_app(stateless_http=True, json_response=True, host=self.host)
+        except Exception as exc:
+            log.exception("could not create the MCP server")
+            self.error = f"setup failed: {exc}"
+            return False
+        config = uvicorn.Config(app, host=self.host, port=self.port, log_level="warning", lifespan="on")
+        self._server = uvicorn.Server(config)
+        self._thread = threading.Thread(target=self._serve, name="mcp-server", daemon=True)
+        self._thread.start()
+        return True
+
+    def _serve(self):
+        try:
+            asyncio.run(self._server.serve())
+        except BaseException as exc:  # includes SystemExit from uvicorn on startup errors
+            self.error = str(exc) or type(exc).__name__
+            log.warning("MCP server stopped: %s", self.error)
+
+    def stop(self) -> None:
+        if self._server is not None:
+            self._server.should_exit = True
+        if self._thread is not None:
+            self._thread.join(timeout=3)
+        self._thread = None
+        self._server = None
+
+    # ------------------------------------------------------------ helpers
+
+    async def gui(self, fn: Callable[[], Any], timeout: float = 10.0):
+        return await asyncio.wait_for(asyncio.wrap_future(self.bridge.submit(fn)), timeout)
+
+    async def fresh_frame(self, timeout: float):
+        """Wait for a frame captured with the current settings. Returns None on timeout."""
+        fut = await self.gui(self.win.request_frame)
+        try:
+            await asyncio.wait_for(asyncio.wrap_future(fut), timeout)
+            return True
+        except asyncio.TimeoutError:
+            fut.cancel()
+            return None
+
+    def _apply(self) -> None:
+        self.win.panel.refresh()
+        self.win._settings_changed()
+
+    def _timeout_info(self, timeout) -> dict:
+        s = self.win.settings
+        return {
+            "error": f"no new frame within {timeout} s",
+            "trigger_mode": s.trigger.mode,
+            "running": bool(self.win.acq and self.win.acq.running),
+            "hint": "In Normal/Single mode the signal may not cross the trigger level; "
+            "try set_trigger(mode='Auto') or adjust the level, or call run() if stopped.",
+        }
+
+    # ------------------------------------------------------------ tools
+
+    def _build(self):
+        mcp = MCPServer("pyhantek", instructions=INSTRUCTIONS)
+        win = self.win
+
+        def settings_dict():
+            s = asdict(win.settings)
+            s["math_mode_name"] = MATH_MODES[win.settings.math_mode]
+            return s
+
+        # ---------------- status
+
+        @mcp.tool()
+        async def get_status() -> dict:
+            """Device, acquisition state, effective sample rate and all current settings."""
+
+            def work():
+                f = win.last_frame
+                acq = win.acq
+                dev = win.device
+                fps = None
+                ft = win.frame_times
+                if len(ft) >= 2:
+                    fps = _num((len(ft) - 1) / max(ft[-1] - ft[0], 1e-6), 3)
+                return {
+                    "device": dev.name,
+                    "demo": dev.is_demo,
+                    "serial": dev.serial,
+                    "firmware": None if dev.is_demo else f"{dev.firmware_version:04x}",
+                    "running": bool(acq and acq.running),
+                    "acquisition_status": win.st_state.text(),
+                    "last_frame": None
+                    if f is None
+                    else {
+                        "triggered": f.triggered,
+                        "roll": f.roll,
+                        "samplerate": f.samplerate,
+                        "record_samples": max((len(d) for d in f.data if d is not None), default=0),
+                        "clipped": {"CH1": f.clipped[0], "CH2": f.clipped[1]},
+                    },
+                    "frames_per_second": fps,
+                    "settings": settings_dict(),
+                    "limits": {
+                        "timebases_s_per_div": TIMEBASES,
+                        "vdiv_at_1x_probe": VDIVS,
+                        "probes": PROBES,
+                        "samplerates": [r.rate for r in win.device.model.sample_rates],
+                        "calfreqs": list(win.device.model.cal_frequencies),
+                    },
+                }
+
+            return await self.gui(work)
+
+        # ---------------- configuration
+
+        @mcp.tool()
+        async def set_channel(
+            channel: Literal["CH1", "CH2"],
+            enabled: bool | None = None,
+            volts_per_div: float | None = None,
+            coupling: Literal["DC", "AC"] | None = None,
+            probe: Literal[1, 10, 100] | None = None,
+            position_div: float | None = None,
+            invert: bool | None = None,
+        ) -> dict:
+            """Configure an input channel. volts_per_div is at the probe tip (it includes the probe factor).
+            position_div moves the 0 V line (-4..4 divisions). AC coupling only works on scopes with the AC/DC mod."""
+
+            def work():
+                i = 0 if channel == "CH1" else 1
+                ch = win.settings.channels[i]
+                if enabled is not None:
+                    other = win.settings.channels[1 - i]
+                    if not enabled and not other.enabled:
+                        raise ValueError("at least one channel must stay enabled")
+                    ch.enabled = enabled
+                if probe is not None:
+                    ch.vdiv = ch.vdiv / ch.probe * probe
+                    ch.probe = probe
+                if volts_per_div is not None:
+                    ch.vdiv = _nearest([v * ch.probe for v in VDIVS], volts_per_div)
+                if coupling is not None:
+                    ch.coupling = coupling
+                if position_div is not None:
+                    ch.offset = max(-4.0, min(4.0, float(position_div)))
+                if invert is not None:
+                    ch.invert = invert
+                self._apply()
+                return asdict(ch)
+
+            return await self.gui(work)
+
+        @mcp.tool()
+        async def set_horizontal(
+            seconds_per_div: float | None = None,
+            samplerate: float | None = None,
+            calfreq: float | None = None,
+        ) -> dict:
+            """Set the timebase (100 ns/div .. 10 s/div), an optional fixed sample rate (0 = automatic),
+            and the frequency of the calibration square-wave output."""
+
+            def work():
+                s = win.settings
+                if seconds_per_div is not None:
+                    s.timebase = _nearest(TIMEBASES, seconds_per_div)
+                if samplerate is not None:
+                    rates = [r.rate for r in win.device.model.sample_rates]
+                    s.samplerate = 0.0 if samplerate <= 0 else _nearest(rates, samplerate)
+                if calfreq is not None:
+                    s.calfreq = float(_nearest(list(win.device.model.cal_frequencies), calfreq))
+                self._apply()
+                return {"seconds_per_div": s.timebase, "samplerate": s.samplerate or "auto", "calfreq": s.calfreq}
+
+            return await self.gui(work)
+
+        @mcp.tool()
+        async def set_trigger(
+            mode: Literal["Auto", "Normal", "Single", "Roll"] | None = None,
+            source: Literal["CH1", "CH2"] | None = None,
+            slope: Literal["Rising", "Falling"] | None = None,
+            level_volts: float | None = None,
+            position: float | None = None,
+            noise_reject: Literal["Off", "Low", "High"] | None = None,
+            level_to_50_percent: bool = False,
+        ) -> dict:
+            """Configure the software trigger. position is where the trigger point sits on screen (0 = left, 1 = right).
+            level_to_50_percent sets the level to the middle of the current signal on the source channel."""
+
+            def work():
+                t = win.settings.trigger
+                if mode is not None:
+                    t.mode = mode
+                if source is not None:
+                    t.source = 0 if source == "CH1" else 1
+                if slope is not None:
+                    t.slope = slope
+                if level_volts is not None:
+                    t.level = float(level_volts)
+                if position is not None:
+                    t.position = max(0.0, min(1.0, float(position)))
+                if noise_reject is not None:
+                    t.noise_reject = NOISE_REJECT.index(noise_reject)
+                if level_to_50_percent:
+                    f = win.last_frame
+                    d = f.data[t.source] if f is not None else None
+                    if d is not None and np.isfinite(d).any():
+                        t.level = round(float((np.nanmax(d) + np.nanmin(d)) / 2), 4)
+                self._apply()
+                out = asdict(t)
+                out["source"] = ["CH1", "CH2"][t.source]
+                out["noise_reject"] = NOISE_REJECT[t.noise_reject]
+                return out
+
+            return await self.gui(work)
+
+        @mcp.tool()
+        async def set_math(
+            enabled: bool | None = None,
+            function: Literal["CH1 + CH2", "CH1 - CH2", "CH2 - CH1", "CH1 * CH2"] | None = None,
+            volts_per_div: float | None = None,
+            position_div: float | None = None,
+        ) -> dict:
+            """Configure the math trace (computed from CH1 and CH2)."""
+
+            def work():
+                s = win.settings
+                if enabled is not None:
+                    s.math_enabled = enabled
+                if function is not None:
+                    names = [m.replace("−", "-").replace("×", "*") for m in MATH_MODES]
+                    s.math_mode = names.index(function)
+                if volts_per_div is not None:
+                    s.math_vdiv = _nearest(list(VDIVS) + [10.0, 20.0, 50.0], volts_per_div)
+                if position_div is not None:
+                    s.math_offset = max(-4.0, min(4.0, float(position_div)))
+                self._apply()
+                fn = MATH_MODES[s.math_mode].replace("−", "-").replace("×", "*")
+                return {"enabled": s.math_enabled, "function": fn, "volts_per_div": s.math_vdiv,
+                        "position_div": s.math_offset}
+
+            return await self.gui(work)
+
+        @mcp.tool()
+        async def set_display(
+            spectrum: bool | None = None,
+            spectrum_window: Literal["Hann", "Hamming", "Blackman", "Flat top", "Rectangular"] | None = None,
+            averaging: Literal[1, 2, 4, 8, 16, 32] | None = None,
+            interpolation: Literal["Linear", "Sin(x)/x", "Dots"] | None = None,
+            cursors: bool | None = None,
+        ) -> dict:
+            """Display options: spectrum view, FFT window, trace averaging, drawing style and cursors."""
+
+            def work():
+                s = win.settings
+                if spectrum is not None:
+                    s.spectrum_enabled = spectrum
+                if spectrum_window is not None:
+                    s.spectrum_window = spectrum_window
+                if averaging is not None:
+                    s.averaging = int(averaging)
+                if interpolation is not None:
+                    s.interpolation = interpolation
+                if cursors is not None:
+                    s.cursors = cursors
+                self._apply()
+                return {"spectrum": s.spectrum_enabled, "spectrum_window": s.spectrum_window, "averaging": s.averaging,
+                        "interpolation": s.interpolation, "cursors": s.cursors}
+
+            return await self.gui(work)
+
+        # ---------------- acquisition control
+
+        @mcp.tool()
+        async def run() -> dict:
+            """Start continuous acquisition."""
+            await self.gui(lambda: win.acq and win.acq.set_running(True))
+            return {"running": True}
+
+        @mcp.tool()
+        async def stop() -> dict:
+            """Stop acquisition; the last trace stays on screen and can still be measured."""
+            await self.gui(lambda: win.acq and win.acq.set_running(False))
+            return {"running": False}
+
+        @mcp.tool()
+        async def single(timeout_s: float = 10.0) -> dict:
+            """Arm a single-shot capture and wait for the trigger. Returns the measurements of the captured trace."""
+            await self.gui(win.single_shot)
+            if await self.fresh_frame(timeout_s) is None:
+                return self._timeout_info(timeout_s)
+            return await self.gui(self._measurements)
+
+        @mcp.tool()
+        async def autoset(timeout_s: float = 15.0) -> dict:
+            """Automatically choose V/div, position, timebase and trigger level for the connected signals."""
+            await self.gui(win.autoset)
+            loop = asyncio.get_running_loop()
+            end = loop.time() + timeout_s
+            while loop.time() < end:
+                await asyncio.sleep(0.2)
+                if not await self.gui(lambda: win.autoset_stage):
+                    break
+            else:
+                return {"error": "autoset did not finish", "settings": await self.gui(settings_dict)}
+            await self.fresh_frame(5.0)
+            return {"settings": await self.gui(settings_dict), "measurements": await self.gui(self._measurements)}
+
+        # ---------------- data
+
+        @mcp.tool()
+        async def get_measurements(fresh: bool = True, timeout_s: float = 5.0) -> dict:
+            """Automatic measurements of the on-screen part of each enabled trace: frequency, period, Vpp, max, min,
+            mean, RMS, AC RMS, duty cycle (0..1), rise and fall time (10-90 %). Null means not measurable.
+            With fresh=True it first waits for a frame captured with the current settings."""
+            if fresh and await self.gui(lambda: bool(win.acq and win.acq.running)):
+                if await self.fresh_frame(timeout_s) is None:
+                    return self._timeout_info(timeout_s)
+            return await self.gui(self._measurements)
+
+        @mcp.tool()
+        async def get_waveform(
+            channel: CHANNEL = "CH1",
+            max_points: int = 500,
+            span: Literal["screen", "record"] = "screen",
+            fresh: bool = True,
+        ) -> dict:
+            """Sample data of one trace as time/voltage pairs. span='screen' returns what is visible
+            (time 0 = trigger point); span='record' returns the whole capture. Data is evenly decimated
+            to max_points (<= 5000), so read samplerate_effective before interpreting fast edges."""
+            if fresh and await self.gui(lambda: bool(win.acq and win.acq.running)):
+                await self.fresh_frame(5.0)
+
+            def work():
+                f = win.last_frame
+                if f is None or win.last_view is None:
+                    return {"error": "no data yet"}
+                s = win.settings
+                idx = {"CH1": 0, "CH2": 1, "MATH": 2}[channel]
+                if span == "screen":
+                    x, volts, sr = win.last_view
+                    v = volts[idx]
+                    if v is None:
+                        return {"error": f"{channel} is not enabled"}
+                    t = (x[: len(v)] - s.trigger.position * 10) * s.timebase
+                    keep = (x[: len(v)] >= 0) & (x[: len(v)] <= 10)
+                    t, v = t[keep], v[keep]
+                else:
+                    data = list(f.data)
+                    if idx == 2:
+                        if data[0] is None or data[1] is None:
+                            return {"error": "math needs both channels"}
+                        v = math_channel(s.math_mode, data[0], data[1])
+                    else:
+                        v = data[idx]
+                    if v is None:
+                        return {"error": f"{channel} is not enabled"}
+                    t = (np.arange(len(v)) - f.trigger_index) / f.samplerate
+                    sr = f.samplerate
+                n = len(v)
+                m = max(2, min(int(max_points), 5000, n))
+                sel = np.linspace(0, n - 1, m).round().astype(int)
+                return {
+                    "channel": channel,
+                    "unit": "V^2" if idx == 2 and s.math_mode == 3 else "V",
+                    "samplerate": sr,
+                    "samples_total": n,
+                    "samplerate_effective": _num(sr * (m - 1) / max(n - 1, 1)),
+                    "triggered": f.triggered,
+                    "time_s": [_num(x, 6) for x in t[sel]],
+                    "volts": [_num(x, 5) for x in v[sel]],
+                }
+
+            return await self.gui(work)
+
+        @mcp.tool()
+        async def get_spectrum(
+            channel: CHANNEL = "CH1",
+            peaks: int = 10,
+            window: Literal["Hann", "Hamming", "Blackman", "Flat top", "Rectangular"] = "Flat top",
+            fresh: bool = True,
+        ) -> dict:
+            """FFT of the full capture. Returns the strongest peaks (frequency in Hz, level in dBV rms),
+            the noise floor, and THD of the strongest tone (harmonics 2..10). 'Flat top' gives accurate amplitudes;
+            'Hann' gives better frequency resolution."""
+            if fresh and await self.gui(lambda: bool(win.acq and win.acq.running)):
+                await self.fresh_frame(5.0)
+
+            def work():
+                f = win.last_frame
+                if f is None:
+                    return {"error": "no data yet"}
+                s = win.settings
+                idx = {"CH1": 0, "CH2": 1, "MATH": 2}[channel]
+                if idx == 2:
+                    if f.data[0] is None or f.data[1] is None:
+                        return {"error": "math needs both channels"}
+                    v = math_channel(s.math_mode, f.data[0], f.data[1])
+                else:
+                    v = f.data[idx]
+                if v is None:
+                    return {"error": f"{channel} is not enabled"}
+                return _analyse_spectrum(v, f.samplerate, window, peaks)
+
+            return await self.gui(work)
+
+        @mcp.tool()
+        async def screenshot(include_panel: bool = False) -> Image:
+            """PNG image of the scope screen (traces, spectrum and measurement table).
+            include_panel=True captures the whole window including the control panel."""
+
+            def work():
+                widget = win if include_panel else win.splitter
+                pix = widget.grab()
+                ba = QByteArray()
+                buf = QBuffer(ba)
+                buf.open(QIODevice.WriteOnly)
+                pix.save(buf, "PNG")
+                return bytes(ba.data())
+
+            return Image(data=await self.gui(work), format="png")
+
+        return mcp
+
+    # runs on the GUI thread
+    def _measurements(self) -> dict:
+        win = self.win
+        f = win.last_frame
+        if f is None or win.last_view is None:
+            return {"error": "no data yet"}
+        x, volts, sr = win.last_view
+        on = (x >= 0) & (x <= 10)
+        out: dict[str, Any] = {
+            "triggered": f.triggered,
+            "samplerate": sr,
+            "seconds_per_div": win.settings.timebase,
+            "channels": {},
+        }
+        for i, name in enumerate(["CH1", "CH2", "MATH"]):
+            v = volts[i]
+            if v is None:
+                continue
+            m = measure(v[on[: len(v)]], sr, f.lsb[i] if i < 2 else 0.0)
+            unit = "V^2" if i == 2 and win.settings.math_mode == 3 else "V"
+            d = {k: _num(val) for k, val in asdict(m).items()}
+            d["unit"] = unit
+            if i < 2:
+                d["clipped"] = f.clipped[i]
+                d["volts_per_div"] = win.settings.channels[i].vdiv
+            out["channels"][name] = d
+        return out
+
+
+def _analyse_spectrum(v: np.ndarray, sr: float, win: str, npeaks: int) -> dict:
+    freqs, db = spectrum(v, sr, win)
+    if len(db) < 8:
+        return {"error": "not enough samples"}
+    df = freqs[1] - freqs[0]
+    floor = float(np.median(db[1:]))
+    # local maxima clearly above the noise floor, skipping DC
+    k = np.arange(2, len(db) - 1)
+    is_peak = (db[k] >= db[k - 1]) & (db[k] > db[k + 1]) & (db[k] > floor + 15)
+    cand = k[is_peak]
+    cand = cand[np.argsort(db[cand])[::-1]]
+    chosen: list[int] = []
+    for c in cand:  # keep peaks at least 3 bins apart (window main lobe)
+        if all(abs(c - o) > 3 for o in chosen):
+            chosen.append(int(c))
+        if len(chosen) >= max(1, min(int(npeaks), 50)):
+            break
+    result: dict[str, Any] = {
+        "samplerate": sr,
+        "resolution_hz": _num(df),
+        "window": win,
+        "dc_dbv": _num(db[0], 4),
+        "noise_floor_dbv": _num(floor, 4),
+        "peaks": [{"freq_hz": _num(freqs[c]), "dbv": _num(db[c], 4), "vrms": _num(10 ** (db[c] / 20), 4)} for c in chosen],
+    }
+    if chosen and chosen[0] < 20:
+        result["thd_percent"] = None
+        result["thd_note"] = "too few signal periods in the record for THD; use a slower timebase"
+    elif chosen:
+        f0 = chosen[0]
+        fund = 10 ** (db[f0] / 20)
+        harm = []
+        for h in range(2, 11):
+            b = f0 * h
+            if b + 2 >= len(db):
+                break
+            harm.append(10 ** (np.max(db[b - 2 : b + 3]) / 20))
+        if harm:
+            result["thd_percent"] = _num(100 * math.sqrt(sum(a * a for a in harm)) / fund, 4)
+            result["fundamental_hz"] = _num(freqs[f0])
+    return result

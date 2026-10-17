@@ -6,6 +6,7 @@ import csv
 import math
 import time
 from collections import deque
+from concurrent.futures import Future
 
 import numpy as np
 from PySide6.QtCore import QSettings, Qt, QTimer
@@ -79,10 +80,13 @@ class Banner(QFrame):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, device, reconnect=None):
+    def __init__(self, device, reconnect=None, mcp_host="127.0.0.1", mcp_port=None, mcp_enabled=None):
         super().__init__()
         self.reconnect_cb = reconnect
-        self.store = QSettings("pyhantek", "pyhantek")
+        self.settings_gen = 0
+        self._frame_waiters: list[tuple[int, Future]] = []
+        self.mcp = None
+        self.store = QSettings()  # organisation/application set in app.main (tests use their own)
         self.settings = Settings.from_json(self.store.value("settings", ""))
         self.acq: Acquisition | None = None
         self.last_frame: Frame | None = None
@@ -106,6 +110,57 @@ class MainWindow(QMainWindow):
         if state is not None:
             self.splitter.restoreState(state)
         self._settings_changed()
+        self._init_mcp(mcp_host, mcp_port, mcp_enabled)
+
+    # ------------------------------------------------------------ MCP
+
+    def _init_mcp(self, host, port, enabled):
+        from ..mcp_server import DEFAULT_PORT, McpServer
+
+        port = int(port or self.store.value("mcp_port", DEFAULT_PORT))
+        if enabled is None:
+            enabled = str(self.store.value("mcp_enabled", "true")).lower() == "true"
+        self.mcp = McpServer(self, host, port)
+        self.mcp_action.setChecked(enabled)
+        self._toggle_mcp(enabled)
+
+    def _toggle_mcp(self, on):
+        if self.mcp is None:
+            return
+        if on:
+            ok = self.mcp.start()
+            if not ok:
+                self.mcp_action.blockSignals(True)
+                self.mcp_action.setChecked(False)
+                self.mcp_action.blockSignals(False)
+                self.st_mcp.setText(f"MCP off: {self.mcp.error}")
+                self.st_mcp.setStyleSheet(f"color:{theme.BAD};")
+                return
+            self.st_mcp.setText(f"MCP ● {self.mcp.url}")
+            self.st_mcp.setStyleSheet(f"color:{theme.GOOD};")
+            self.st_mcp.setToolTip(f"AI assistants can control the scope.\nClaude Code: claude mcp add --transport http pyhantek {self.mcp.url}")
+        else:
+            self.mcp.stop()
+            self.st_mcp.setText("MCP off")
+            self.st_mcp.setStyleSheet(f"color:{theme.MUTED};")
+        self.store.setValue("mcp_enabled", "true" if on else "false")
+
+    def request_frame(self) -> Future:
+        """Future resolved when a frame captured with the current settings has been drawn (GUI thread)."""
+        fut: Future = Future()
+        self._frame_waiters.append((self.settings_gen, fut))
+        return fut
+
+    def _resolve_waiters(self, frame):
+        keep = []
+        for gen, fut in self._frame_waiters:
+            if fut.cancelled():
+                continue
+            if frame.generation >= gen:
+                fut.set_result(True)
+            else:
+                keep.append((gen, fut))
+        self._frame_waiters = keep
 
     # ------------------------------------------------------------ UI
 
@@ -152,6 +207,9 @@ class MainWindow(QMainWindow):
         action("Export CSV", self.export_csv, "Ctrl+E", "Export the visible traces (Ctrl+E)")
         action("Calibrate", self.calibrate, None, "Measure the 0 V offsets with grounded inputs")
         action("Reset", self.reset_settings, None, "Restore default settings")
+        self.mcp_action = action("MCP", lambda: None, None, "Let AI assistants control the scope over MCP (localhost only)")
+        self.mcp_action.setCheckable(True)
+        self.mcp_action.toggled.connect(self._toggle_mcp)
         action("About", self.about)
 
         central = QWidget(objectName="Root")
@@ -191,6 +249,7 @@ class MainWindow(QMainWindow):
         self.st_state = QLabel()
         self.st_rate = QLabel()
         self.st_fps = QLabel()
+        self.st_mcp = QLabel()
         self.progress = QProgressBar()
         self.progress.setMaximumWidth(160)
         self.progress.setRange(0, 1000)
@@ -199,6 +258,7 @@ class MainWindow(QMainWindow):
         sb.addWidget(self.st_state)
         sb.addWidget(self.st_rate)
         sb.addPermanentWidget(self.progress)
+        sb.addPermanentWidget(self.st_mcp)
         sb.addPermanentWidget(self.st_fps)
 
         self.panel.changed.connect(self._settings_changed)
@@ -262,6 +322,7 @@ class MainWindow(QMainWindow):
         self.device_chip.setText(f"●  {device.name}{serial}{fw}")
         self.device_chip.setStyleSheet(f"color:{theme.WARN if device.is_demo else theme.GOOD}; padding: 0 12px;")
         self.acq = Acquisition(device, self.settings)
+        self.acq.update_settings(self.settings, self.settings_gen)
         self.acq.frame_ready.connect(self._on_frame)
         self.acq.status.connect(self._on_status)
         self.acq.progress.connect(self._on_progress)
@@ -303,8 +364,9 @@ class MainWindow(QMainWindow):
             self.panel._fill_rates()
         self.scope.apply_settings(s)
         self.spectrum.setVisible(s.spectrum_enabled)
+        self.settings_gen += 1
         if self.acq:
-            self.acq.update_settings(s)
+            self.acq.update_settings(s, self.settings_gen)
         self._redraw()
 
     def _on_level_dragged(self, v):
@@ -421,6 +483,7 @@ class MainWindow(QMainWindow):
         else:
             self.scope.set_badge("AUTO", theme.WARN)
         self._redraw(new_frame=True)
+        self._resolve_waiters(frame)
         if self.autoset_stage:
             self._autoset_step(frame)
 
@@ -574,12 +637,11 @@ class MainWindow(QMainWindow):
         if self.acq and not self.acq.running:
             self.acq.set_running(True)
         self.autoset_stage = 1
-        self._autoset_skip = 2  # ignore frames captured with the old settings
+        self._autoset_gen = self.settings_gen  # ignore frames captured with older settings
         self.statusBar().showMessage("Autoset…", 3000)
 
     def _autoset_step(self, frame: Frame):
-        if self._autoset_skip > 0:
-            self._autoset_skip -= 1
+        if frame.generation < self._autoset_gen:
             return
         s = self.settings
         best_freq = None
@@ -610,12 +672,12 @@ class MainWindow(QMainWindow):
         s.trigger.position = 0.5
         if self.autoset_stage == 1:
             self.autoset_stage = 2
-            self._autoset_skip = 2
         else:
             self.autoset_stage = 0
             self.statusBar().showMessage("Autoset done", 2000)
         self.panel.refresh()
         self._settings_changed()
+        self._autoset_gen = self.settings_gen
 
     # ------------------------------------------------------------ export
 
@@ -682,6 +744,8 @@ class MainWindow(QMainWindow):
         self.store.setValue("settings", self.settings.to_json())
         self.store.setValue("geometry", self.saveGeometry())
         self.store.setValue("splitter", self.splitter.saveState())
+        if self.mcp:
+            self.mcp.stop()
         if self.acq:
             self.acq.shutdown()
         super().closeEvent(ev)

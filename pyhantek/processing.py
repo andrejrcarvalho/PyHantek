@@ -118,14 +118,24 @@ def measure(x: np.ndarray, samplerate: float, lsb: float = 0.0) -> Measurement:
     lo = m.vmin + 0.4 * m.vpp
     hi = m.vmin + 0.6 * m.vpp
     rising, falling = _crossings(x, lo, hi)
-    if rising.size >= 2:
-        period = (rising[-1] - rising[0]) / (rising.size - 1) / samplerate
+    edges = rising if rising.size >= falling.size else falling
+    if edges.size < 2:
+        edges = falling if edges is rising else rising
+    if edges.size >= 2:
+        period = (edges[-1] - edges[0]) / (edges.size - 1) / samplerate
         m.period = period
         m.freq = 1.0 / period
+    if rising.size >= 2:
         # duty cycle: high time between the first and last rising edge
         f_in = falling[(falling > rising[0]) & (falling < rising[-1])]
         if f_in.size == rising.size - 1:
-            m.duty = float(np.mean(f_in - rising[:-1]) / (period * samplerate))
+            m.duty = float(np.mean(f_in - rising[:-1]) / ((rising[-1] - rising[0]) / (rising.size - 1)))
+    elif rising.size == 1 and falling.size >= 2 and math.isfinite(m.period):
+        # one full low phase framed by two falling edges
+        r = rising[0]
+        if falling[0] < r < falling[-1]:
+            nxt = falling[falling > r][0]
+            m.duty = float((nxt - r) / (m.period * samplerate))
     # 10 % / 90 % edge times around the first full edge
     p10 = m.vmin + 0.1 * m.vpp
     p90 = m.vmin + 0.9 * m.vpp

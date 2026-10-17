@@ -35,6 +35,7 @@ class Frame:
     clipped: list[bool] = field(default_factory=lambda: [False, False])
     lsb: list[float] = field(default_factory=lambda: [0.0, 0.0])  # volts per ADC digit
     timestamp: float = field(default_factory=time.monotonic)
+    generation: int = 0  # settings generation this frame was captured with
 
 
 @dataclass
@@ -82,6 +83,8 @@ class Acquisition(QThread):
         if not device.is_demo:
             self.cal_file = self.cal.load_ini(self.model, device.serial)
         self._settings = copy.deepcopy(settings)
+        self._generation = 0
+        self._cur_gen = 0
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._stop_capture = threading.Event()
@@ -95,10 +98,11 @@ class Acquisition(QThread):
 
     # ------------------------------------------------------------ API (GUI thread)
 
-    def update_settings(self, settings: Settings) -> None:
+    def update_settings(self, settings: Settings, generation: int = 0) -> None:
         with self._lock:
             old = self._settings
             self._settings = copy.deepcopy(settings)
+            self._generation = generation
         # abort slow captures when the user changes something that matters
         if (old.timebase, old.samplerate, old.trigger.mode, old.channel_count()) != (
             settings.timebase,
@@ -167,6 +171,7 @@ class Acquisition(QThread):
 
     def _snapshot(self) -> Settings:
         with self._lock:
+            self._cur_gen = self._generation
             return copy.deepcopy(self._settings)
 
     def _hw_config(self, s: Settings) -> HwConfig:
@@ -273,7 +278,8 @@ class Acquisition(QThread):
 
         if trigger_index is None:
             if trig.mode == "Auto":
-                frame = Frame(rate.rate, data, min(pre, max(n - 1, 0)), False, clipped=clipped, lsb=lsb)
+                frame = Frame(rate.rate, data, min(pre, max(n - 1, 0)), False, clipped=clipped, lsb=lsb,
+                              generation=self._cur_gen)
                 self.frame_ready.emit(frame)
                 self.status.emit("Auto")
             else:
@@ -281,7 +287,8 @@ class Acquisition(QThread):
             self._pace(s)
             return
 
-        self.frame_ready.emit(Frame(rate.rate, data, trigger_index, True, clipped=clipped, lsb=lsb))
+        self.frame_ready.emit(Frame(rate.rate, data, trigger_index, True, clipped=clipped, lsb=lsb,
+                                    generation=self._cur_gen))
         self.status.emit("Triggered")
         if trig.mode == "Single":
             self._running = False
@@ -344,7 +351,7 @@ class Acquisition(QThread):
 
     def _emit_roll(self, rate, data, clipped, lsb):
         out = [self._roll[ch].copy() if data[ch] is not None else None for ch in range(2)]
-        self.frame_ready.emit(Frame(rate, out, 0, False, roll=True, clipped=clipped, lsb=lsb))
+        self.frame_ready.emit(Frame(rate, out, 0, False, roll=True, clipped=clipped, lsb=lsb, generation=self._cur_gen))
 
     # ------------------------------------------------------------ offset calibration
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import threading
 
@@ -80,13 +81,17 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="pyhantek", description="Oscilloscope app for Hantek DSO-6022 family scopes")
     ap.add_argument("--demo", action="store_true", help="start with the simulated demo device")
     ap.add_argument("-v", "--verbose", action="count", default=0, help="more log output (-vv for debug)")
+    ap.add_argument("--mcp-port", type=int, default=None, help="port of the built-in MCP server (default 8765)")
+    ap.add_argument("--mcp-host", default="127.0.0.1", help="interface for the MCP server (default 127.0.0.1)")
+    ap.add_argument("--no-mcp", action="store_true", help="start with the MCP server switched off")
     ap.add_argument("--version", action="version", version=f"pyhantek {__version__}")
     args = ap.parse_args(argv)
     logging.basicConfig(level=[logging.WARNING, logging.INFO, logging.DEBUG][min(args.verbose, 2)],
                         format="%(levelname)s %(name)s: %(message)s")
 
     QCoreApplication.setOrganizationName("pyhantek")
-    QCoreApplication.setApplicationName("PyHantek")
+    # PYHANTEK_PROFILE keeps separate saved settings (used by tests)
+    QCoreApplication.setApplicationName("pyhantek" + (f"-{os.environ['PYHANTEK_PROFILE']}" if os.environ.get("PYHANTEK_PROFILE") else ""))
     app = QApplication(sys.argv[:1])
     from .ui import theme
     from .ui.mainwindow import MainWindow
@@ -95,7 +100,13 @@ def main(argv: list[str] | None = None) -> int:
     device = None if args.demo else open_scope(None, quiet=True)
     if device is None:
         device = DemoDevice()
-    win = MainWindow(device, reconnect=lambda parent: open_scope(parent))
+    win = MainWindow(
+        device,
+        reconnect=lambda parent: open_scope(parent),
+        mcp_host=args.mcp_host,
+        mcp_port=args.mcp_port,
+        mcp_enabled=False if args.no_mcp else None,
+    )
     win.show()
     return app.exec()
 
