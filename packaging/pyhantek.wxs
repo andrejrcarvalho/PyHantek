@@ -1,0 +1,44 @@
+<!-- WiX v5 source for the PyHantek MSI. Built by build_msi.ps1:
+       wix build -arch x64 -d Version=<x.y.z> -d AppDir=<PyInstaller folder> -d Icon=<.ico> -o out.msi pyhantek.wxs
+     Installs to Program Files\PyHantek with Start menu and desktop shortcuts. -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="PyHantek" Manufacturer="PyHantek" Version="$(var.Version)"
+           UpgradeCode="974103d0-9823-404e-9b57-dbb02625dae0" Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of PyHantek is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="PyHantek.ico" SourceFile="$(var.Icon)" />
+    <Property Id="ARPPRODUCTICON" Value="PyHantek.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/andrejrcarvalho/PyHantek" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="PyHantek" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
+      <Files Include="$(var.AppDir)\**" />
+    </ComponentGroup>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut">
+        <Shortcut Id="StartMenuShortcut" Name="PyHantek" Description="Oscilloscope for Hantek DSO-6022 USB scopes"
+                  Target="[INSTALLFOLDER]PyHantek.exe" WorkingDirectory="INSTALLFOLDER" Icon="PyHantek.ico" />
+        <RegistryValue Root="HKMU" Key="Software\PyHantek" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcut">
+        <Shortcut Id="DesktopShortcut" Name="PyHantek" Description="Oscilloscope for Hantek DSO-6022 USB scopes"
+                  Target="[INSTALLFOLDER]PyHantek.exe" WorkingDirectory="INSTALLFOLDER" Icon="PyHantek.ico" />
+        <RegistryValue Root="HKMU" Key="Software\PyHantek" Name="DesktopShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="Main">
+      <ComponentGroupRef Id="AppFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+  </Package>
+</Wix>

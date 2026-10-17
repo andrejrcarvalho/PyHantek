@@ -35,9 +35,13 @@ Run the tests with `uv run pytest`.
 | Platform | File | How to build |
 | --- | --- | --- |
 | Linux (x86-64) | `dist/PyHantek-<version>-x86_64.AppImage` | `./packaging/build_appimage.sh` |
+| Linux (Debian/Ubuntu) | `dist/pyhantek_<version>_amd64.deb` | `./packaging/build_deb.sh` |
 | Windows (x64) | `dist\PyHantek-<version>-windows-x64.exe` | `powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1` (run on Windows) |
+| Windows installer (x64) | `dist\PyHantek-<version>-windows-x64.msi` | `powershell -ExecutionPolicy Bypass -File packaging\build_msi.ps1` (run on Windows, needs the .NET SDK) |
 
-PyInstaller can't cross-compile, so the `.exe` has to be built on Windows. The GitHub Actions workflow (`.github/workflows/build.yml`) builds both files on every push. When you push a `v*` tag, it attaches them to a GitHub release.
+PyInstaller can't cross-compile, so the `.exe` and `.msi` have to be built on Windows. The GitHub Actions workflow (`.github/workflows/build.yml`) builds all four files on every push. When you push a `v*` tag, it attaches them to a GitHub release.
+
+The `.deb` (`sudo apt install ./pyhantek_*.deb`) installs the app to `/opt/pyhantek`, a `pyhantek` command, the applications-menu entry and the udev rule, so USB access works after replugging the scope. The `.msi` installs to `Program Files\PyHantek` and adds Start menu and desktop shortcuts.
 
 To run the AppImage: `chmod +x PyHantek-*.AppImage && ./PyHantek-*.AppImage`. It needs a distro with a glibc at least as new as the build machine's (Ubuntu 22.04 for CI builds). For USB access, install the udev rule once:
 `./PyHantek-*.AppImage --udev-rules | sudo tee /etc/udev/rules.d/60-openhantek.rules && sudo udevadm control --reload`

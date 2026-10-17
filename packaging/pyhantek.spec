@@ -1,5 +1,5 @@
 # PyInstaller spec for PyHantek.
-#   Windows: one self-contained PyHantek.exe
+#   Windows: one self-contained PyHantek.exe, or with PYHANTEK_ONEDIR=1 a folder (PyHantek/) for the MSI
 #   Linux:   a folder (build/dist/pyhantek/) that build_appimage.sh wraps into an AppImage
 # Build with:  uv run pyinstaller --noconfirm packaging/pyhantek.spec
 import os
@@ -9,6 +9,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, co
 
 ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
 WINDOWS = sys.platform == "win32"
+ONEDIR = os.environ.get("PYHANTEK_ONEDIR") == "1"
 
 datas = collect_data_files("pyhantek", includes=["firmware/*.hex", "assets/*"])
 binaries = []
@@ -56,7 +57,10 @@ pyz = PYZ(a.pure)
 
 icon = os.path.join(ROOT, "pyhantek", "assets", "pyhantek.ico" if WINDOWS else "pyhantek.png")
 
-if WINDOWS:
+if WINDOWS and ONEDIR:
+    exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="PyHantek", console=False, icon=icon, upx=False)
+    coll = COLLECT(exe, a.binaries, a.datas, name="PyHantek", upx=False)
+elif WINDOWS:
     exe = EXE(
         pyz,
         a.scripts,
