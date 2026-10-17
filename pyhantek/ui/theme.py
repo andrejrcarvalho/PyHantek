@@ -21,6 +21,7 @@ GRID = "#2b3240"
 GRID_CENTER = "#4a5466"
 
 CH_COLORS = ["#facc15", "#22d3ee", "#e879f9"]  # CH1, CH2, MATH
+XY_COLOR = "#4ade80"
 SPECTRUM_COLORS = ["#fde68a", "#a5f3fc", "#f5d0fe"]
 
 

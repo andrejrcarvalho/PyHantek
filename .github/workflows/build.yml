@@ -36,7 +36,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: sudo apt-get update && sudo apt-get install -y $QT_DEPS
-      - run: ./packaging/build_appimage.sh
+      - run: bash packaging/build_appimage.sh
       - uses: actions/upload-artifact@v4
         with:
           name: PyHantek-linux-x86_64

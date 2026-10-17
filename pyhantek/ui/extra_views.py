@@ -25,12 +25,12 @@ class Phosphor:
 
     def __init__(self, plot: pg.PlotItem, width: int = 1000, height: int = 400):
         self.w, self.h = width, height
-        self.buf = np.zeros((3, height, width), np.float32)
+        self.buf = np.zeros((4, height, width), np.float32)  # CH1, CH2, Math, XY
         self.item = pg.ImageItem(axisOrder="row-major")
         self.item.setZValue(2)
         plot.addItem(self.item)
         self.last = None
-        self.colors = np.array([pg.mkColor(c).getRgbF()[:3] for c in theme.CH_COLORS], np.float32)
+        self.colors = np.array([pg.mkColor(c).getRgbF()[:3] for c in (*theme.CH_COLORS, theme.XY_COLOR)], np.float32)
 
     def clear(self):
         self.buf[:] = 0
@@ -80,7 +80,7 @@ class Phosphor:
         self.buf[i] += np.minimum(flat.reshape(self.h, self.w), 4.0)
 
     def _render(self):
-        a = 1.0 - np.exp(-self.buf * 0.5)  # (3, h, w) 0..1
+        a = 1.0 - np.exp(-self.buf * 0.5)  # (4, h, w) 0..1
         alpha = a.max(axis=0)
         rgb = np.einsum("chw,ck->hwk", a, self.colors) / np.maximum(a.sum(axis=0), 1e-6)[..., None]
         img = np.empty((self.h, self.w, 4), np.uint8)
@@ -244,7 +244,7 @@ class ZoomView(pg.PlotWidget):
 class SpectrogramView(pg.PlotWidget):
     """Waterfall of FFT history: frequency on a log x axis, newest spectrum at the top."""
 
-    ROWS = 200
+    ROWS = 100
     COLS = 600
 
     def __init__(self, parent=None):
@@ -275,7 +275,8 @@ class SpectrogramView(pg.PlotWidget):
         p.addItem(self.title)
         self.db_range = (-100.0, 10.0)
 
-    def clear(self):
+    def reset_history(self):
+        # not called clear(): PlotWidget puts PlotItem.clear on each instance, which would remove our image
         self.data[:] = -120.0
         self.key = None
 

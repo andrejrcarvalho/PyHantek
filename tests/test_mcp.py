@@ -142,8 +142,9 @@ def test_math_expression_over_mcp(client):
     r = client.call("set_math", enabled=True, expression="diff(lowpass(ch1, fs / 50))", volts_per_div=1e4)
     assert r["unit"] == "V/s"
     m = client.call("get_measurements")
-    # demo CH1 = 1.5 sin(wt) + 0.25 sin(3wt + 0.4): peak slope between 1.5w and 2.25w
-    assert 1.4 * 2 * np.pi * 1000 < m["channels"]["MATH"]["vmax"] < 2.4 * 2 * np.pi * 1000
+    # demo CH1 = 1.5 sin(wt) + 0.25 sin(3wt + 0.4): noiseless peak slope is between 1.5w and 2.25w;
+    # leave room for the demo noise that survives the low-pass
+    assert 1.4 * 2 * np.pi * 1000 < m["channels"]["MATH"]["vmax"] < 2.8 * 2 * np.pi * 1000
     bad = client.call("set_math", expression="__import__('os')")
     assert "_error" in bad
     client.call("set_math", enabled=False, expression="ch1 + ch2")

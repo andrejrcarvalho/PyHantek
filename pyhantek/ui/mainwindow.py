@@ -386,7 +386,7 @@ class MainWindow(QMainWindow):
             self.demo_combo.setCurrentIndex(i)
             self.demo_combo.blockSignals(False)
         self.scope.phosphor.clear()
-        self.spectrogram.clear()
+        self.spectrogram.reset_history()
         self.settings_gen += 1  # frames from the old signal are stale
         if self.acq:
             self.acq.update_settings(self.settings, self.settings_gen)
@@ -635,8 +635,10 @@ class MainWindow(QMainWindow):
                   np.clip(b[:k] / s.channels[1].vdiv + s.channels[1].offset, -DIVS_Y / 2 - 0.02, DIVS_Y / 2 + 0.02))
         self.scope.set_xy(xy)
 
-        if new_frame and s.persistence != 0:
-            self.scope.phosphor.add([xy] if s.xy_mode else full_traces, s.persistence)
+        # history views only take frames captured with the current settings (older ones would smear)
+        fresh = new_frame and f.generation >= self.settings_gen
+        if fresh and s.persistence != 0:
+            self.scope.phosphor.add([None, None, None, xy] if s.xy_mode else full_traces, s.persistence)
         if s.zoom_enabled and not s.xy_mode:
             self.zoom.set_traces(full_traces)
         if s.decoder.enabled and not s.xy_mode:
@@ -662,7 +664,7 @@ class MainWindow(QMainWindow):
                 unit = unit_for(s.math_expr) or "u"
                 parts.append(chip(theme.CH_COLORS[2], f"M {label_for(s.math_expr)} {si_format(s.math_vdiv, unit)}/div"))
         if s.xy_mode:
-            parts.append(chip("#4ade80", "XY"))
+            parts.append(chip(theme.XY_COLOR, "XY"))
         if s.persistence:
             parts.append(chip(theme.MUTED, "Persist " + ("∞" if s.persistence < 0 else f"{s.persistence:g} s")))
         parts.append(chip(theme.TEXT, f"H {si_format(s.timebase, 's')}/div · {si_format(f.samplerate, 'S/s')}"))
@@ -711,7 +713,7 @@ class MainWindow(QMainWindow):
                     on = s.spectrum_channels[i] and (s.channels[i].enabled if i < 2 else s.math_enabled)
                     spectra.append(spectrum(full[i], f.samplerate, s.spectrum_window) if on and full[i] is not None else None)
                 self.spectrum.set_spectra(spectra, f.samplerate / 2)
-            if s.spectrum_view in ("Spectrogram", "Both"):
+            if s.spectrum_view in ("Spectrogram", "Both") and f.generation >= self.settings_gen:
                 i = s.spectrogram_channel
                 if full[i] is not None:
                     fr, db = spectrum(full[i], f.samplerate, s.spectrum_window)
