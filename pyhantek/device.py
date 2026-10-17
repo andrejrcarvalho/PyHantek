@@ -65,9 +65,10 @@ def _backend():
 
         _BACKEND = libusb_package.get_libusb1_backend()
         if _BACKEND is not None:
+            log.info("USB backend: libusb from libusb-package (%s)", libusb_package.get_library_path())
             return _BACKEND
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("libusb-package unavailable: %s", exc)
     base = getattr(sys, "_MEIPASS", None)  # PyInstaller bundle
     if base:
         for name in ("libusb-1.0.so.0", "libusb-1.0.dll", "libusb-1.0.dylib"):
@@ -76,7 +77,9 @@ def _backend():
                 import usb.backend.libusb1 as libusb1
 
                 _BACKEND = libusb1.get_backend(find_library=lambda _name, p=path: p)
+                log.info("USB backend: bundled %s", path)
                 return _BACKEND
+    log.info("USB backend: system libusb")
     return None
 
 
@@ -109,6 +112,7 @@ def find_devices() -> list[FoundDevice]:
     except Exception as exc:
         log.warning("USB scan failed: %s", exc)
         return []
+    log.debug("USB devices: %s", [f"{d.idVendor:04x}:{d.idProduct:04x}" for d in devices])
     found: list[FoundDevice] = []
     for dev in devices:
         ids = (dev.idVendor, dev.idProduct)
@@ -214,6 +218,7 @@ class ScopeDevice:
                 pass  # already configured
             usb.util.claim_interface(self.dev, 0)
         except usb.core.USBError as exc:
+            log.error("opening %s failed: %r (errno %s)", found.model.name, exc, getattr(exc, "errno", None))
             raise DeviceError(self._permission_hint(exc)) from exc
         try:
             self.serial = self.dev.serial_number or "unknown"
@@ -225,8 +230,12 @@ class ScopeDevice:
     @staticmethod
     def _permission_hint(exc) -> str:
         msg = f"cannot open the scope: {exc}"
-        if getattr(exc, "errno", None) == 13 or "Access denied" in str(exc):
-            msg += "\nOn Linux install the udev rule (utils/udev_rules/60-openhantek.rules) and replug the scope."
+        if getattr(exc, "errno", None) == 13 or "Access denied" in str(exc) or "Entity not found" in str(exc):
+            if sys.platform == "win32":
+                msg += ("\nOn Windows the scope needs the WinUSB driver (install it with Zadig) "
+                        "for both IDs: before (04B4) and after (04B5) the firmware upload.")
+            else:
+                msg += "\nOn Linux install the udev rule (pyhantek --udev-rules) and replug the scope."
         return msg
 
     @property

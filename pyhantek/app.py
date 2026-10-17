@@ -57,6 +57,7 @@ def _run_blocking(parent: QWidget | None, label: str, fn):
 def open_scope(parent: QWidget | None = None, quiet: bool = False):
     """Find, prepare (firmware) and open a scope. Returns None if there is none."""
     found = find_devices()
+    log.info("scopes found: %s", [f.label for f in found] or "none")
     if not found:
         if not quiet:
             QMessageBox.information(parent, "PyHantek", "No supported scope found.\n\nCheck the USB cable and (on Linux) the udev rule.")
@@ -73,6 +74,7 @@ def open_scope(parent: QWidget | None = None, quiet: bool = False):
             choice = _run_blocking(parent, "Uploading firmware…", lambda p: upload_firmware(choice, p))
         return ScopeDevice(choice)
     except DeviceError as exc:
+        log.error("could not open %s: %s", choice.model.name, exc)
         QMessageBox.warning(parent, "PyHantek", str(exc))
         return None
 
@@ -97,8 +99,9 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("stdout", "stderr"):
         if getattr(sys, name) is None:
             setattr(sys, name, open(os.devnull, "w"))
-    logging.basicConfig(level=[logging.WARNING, logging.INFO, logging.DEBUG][min(args.verbose, 2)],
-                        format="%(levelname)s %(name)s: %(message)s")
+    from . import logsetup
+
+    logsetup.setup(args.verbose)
 
     QCoreApplication.setOrganizationName("pyhantek")
     # PYHANTEK_PROFILE keeps separate saved settings (used by tests)

@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__
+from ..logsetup import log_path
 from ..acquisition import Acquisition, Frame
 from ..device import DemoDevice
 from ..decoders import DecodeResult, run_decoder
@@ -899,7 +900,8 @@ class MainWindow(QMainWindow):
             "<p>A Python/Qt oscilloscope for Hantek DSO-6022BE/BL, Voltcraft DSO-2020 and DSO-6021.</p>"
             "<p>Protocol, calibration and firmware from OpenHantek6022 and Hantek6022API.</p>"
             "<p><b>Shortcuts:</b> Space run/stop · S single · A autoset · ←/→ timebase · ↑/↓ V/div · "
-            "C cursors · mouse wheel = timebase, Shift+wheel = V/div</p>",
+            "C cursors · mouse wheel = timebase, Shift+wheel = V/div</p>"
+            f"<p><b>Log file:</b> {log_path()}</p>",
         )
 
     # ------------------------------------------------------------ shutdown

@@ -116,7 +116,7 @@ class McpServer:
                 s.bind((self.host, self.port))
         except OSError as exc:
             self.error = f"port {self.port} unavailable ({exc.strerror or exc})"
-            log.warning("MCP server: %s", self.error)
+            log.warning("MCP server: cannot bind %s:%s: %r", self.host, self.port, exc)
             return False
         import uvicorn
 
@@ -130,6 +130,7 @@ class McpServer:
         self._server = uvicorn.Server(config)
         self._thread = threading.Thread(target=self._serve, name="mcp-server", daemon=True)
         self._thread.start()
+        log.info("MCP server listening on %s", self.url)
         return True
 
     def _serve(self):
