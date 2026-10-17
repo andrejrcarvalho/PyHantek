@@ -6,6 +6,19 @@ This project is based on the work done in [OpenHantek6022](https://github.com/Op
 
 Built with PySide6, pyqtgraph, pyusb and numpy.
 
+![PyHantek showing a distorted sine on CH1 and the calibration square wave on CH2, with cursors and automatic measurements](docs/screenshots/main.png)
+
+## Screenshots
+
+| | |
+| --- | --- |
+| ![I²C decoding: the bus lane shows START, read from address 0x48, ACKs and data bytes, with the Decoded table below](docs/screenshots/decoding.png) | ![XY mode with persistence: a 1 kHz / 1.5 kHz Lissajous figure](docs/screenshots/xy-persistence.png) |
+| **Protocol decoding:** UART, I²C and SPI on the trace and in a table | **XY mode + persistence:** Lissajous figures and phosphor-style fading |
+| ![Spectrum with log frequency axis and peak marker, above a scrolling FFT waterfall](docs/screenshots/spectrum.png) | ![Math formula d/dt of CH1 with a zoom window magnifying a region of the trace](docs/screenshots/math-zoom.png) |
+| **Spectrum + spectrogram:** FFT peaks and a scrolling waterfall | **Math + zoom:** formulas such as `diff(ch1)` and a magnified region |
+
+All screenshots use the built-in demo device (`uv run pyhantek --demo`).
+
 ## Run
 
 ```sh
