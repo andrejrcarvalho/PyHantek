@@ -9,7 +9,7 @@ Built with PySide6, pyqtgraph, pyusb and numpy.
 ## Run
 
 ```sh
-cd pyhantek
+git clone https://github.com/andrejrcarvalho/PyHantek.git && cd PyHantek
 uv run pyhantek            # uses a connected scope, or the demo device if none is found
 uv run pyhantek --demo     # always use the simulated demo device (toolbar: sine, UART, I²C, SPI, Lissajous)
 uv run pyhantek -vv        # debug logging
@@ -32,7 +32,7 @@ To run the AppImage: `chmod +x PyHantek-*.AppImage && ./PyHantek-*.AppImage`. It
 ### USB access
 
 * **Linux:** install the udev rule and replug the scope:
-  `sudo cp ../utils/udev_rules/60-openhantek.rules /etc/udev/rules.d/ && sudo udevadm control --reload`
+  `uv run pyhantek --udev-rules | sudo tee /etc/udev/rules.d/60-openhantek.rules && sudo udevadm control --reload`
 * **Windows:** the scope needs the WinUSB driver (for example installed with Zadig) for both the "no firmware" (04B4) and the "firmware loaded" (04B5) IDs. The libusb DLL comes with the `libusb-package` dependency.
 * **macOS:** works without a driver. `libusb-package` provides libusb.
 * **WSL:** USB devices have to be attached with `usbipd`.
