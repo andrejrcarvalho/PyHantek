@@ -26,34 +26,48 @@ def downsample(samples: np.ndarray, factor: int) -> np.ndarray:
 # --------------------------------------------------------------- trigger
 
 
-def find_trigger(x: np.ndarray, level: float, rising: bool, begin: int, end: int, average: int = 1) -> int | None:
+def find_trigger(x: np.ndarray, level: float, rising: bool, begin: int, end: int, average: int = 1,
+                 hysteresis: float | None = None) -> int | None:
     """First index in [begin, end) where `x` crosses `level` in the given direction.
 
-    With `average` > 1 the mean of the `average` samples before the crossing
-    must be on the other side of the level and the mean of the samples after
-    it on the trigger side, which rejects noise-induced crossings.
+    The signal must first have been at least `hysteresis` volts on the other side of the
+    level (default: 3 % of its peak-to-peak swing), so noise riding on the opposite edge
+    cannot fire the trigger. With `average` > 1 the means of the samples just before and
+    after the crossing must also lie on opposite sides of the level.
     """
     s = 1.0 if rising else -1.0
-    y = s * x
+    y = s * np.asarray(x, dtype=np.float64)
     lv = s * level
     n = len(y)
     begin = max(begin, average, 1)
     end = min(end, n - average - 1)
     if end <= begin:
         return None
-    seg = y[begin:end]
-    prev = y[begin - 1 : end - 1]
-    idx = np.flatnonzero((seg >= lv) & (prev < lv)) + begin
-    if idx.size == 0:
+    if hysteresis is None:
+        finite = y[np.isfinite(y)]
+        hysteresis = 0.03 * float(finite.max() - finite.min()) if finite.size else 0.0
+    # armed (0) once the signal is clearly on the far side, fired (1) when it reaches the level
+    state = np.full(n, -1, dtype=np.int8)
+    state[y <= lv - hysteresis] = 0
+    state[y >= lv] = 1
+    known = state >= 0
+    if not known.any():
+        return None
+    idx = np.where(known, np.arange(n), 0)
+    np.maximum.accumulate(idx, out=idx)
+    st = state[idx]
+    st[: int(np.argmax(known))] = -1
+    cand = np.flatnonzero((st[begin:end] == 1) & (st[begin - 1 : end - 1] == 0)) + begin
+    if cand.size == 0:
         return None
     if average > 1:
         cs = np.concatenate(([0.0], np.cumsum(y)))
-        before = (cs[idx] - cs[idx - average]) / average
-        after = (cs[idx + 1 + average] - cs[idx + 1]) / average
-        idx = idx[(before < lv) & (after > lv)]
-        if idx.size == 0:
+        before = (cs[cand] - cs[cand - average]) / average
+        after = (cs[cand + 1 + average] - cs[cand + 1]) / average
+        cand = cand[(before < lv) & (after > lv)]
+        if cand.size == 0:
             return None
-    return int(idx[0])
+    return int(cand[0])
 
 
 # --------------------------------------------------------------- measurements
@@ -194,21 +208,6 @@ def spectrum(x: np.ndarray, samplerate: float, win: str = "Hann") -> tuple[np.nd
     amp[0] /= 2.0
     freqs = np.fft.rfftfreq(n, 1.0 / samplerate)
     return freqs, 20.0 * np.log10(np.maximum(amp / math.sqrt(2), 1e-9))
-
-
-# --------------------------------------------------------------- math channel
-
-
-def math_channel(mode: int, a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    n = min(len(a), len(b))
-    a, b = a[:n], b[:n]
-    if mode == 0:
-        return a + b
-    if mode == 1:
-        return a - b
-    if mode == 2:
-        return b - a
-    return a * b
 
 
 # --------------------------------------------------------------- display

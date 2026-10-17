@@ -332,6 +332,74 @@ class DemoDevice:
     def read_calibration(self) -> bytes | None:
         return None
 
+    SIGNALS = ("sine", "uart", "i2c", "spi", "lissajous")
+    signal = "sine"
+    _patterns: dict = {}
+
+    def _pattern(self, name):
+        """Repeating logic patterns for the protocol demos (built once)."""
+        if name not in self._patterns:
+            if name == "uart":
+                bits = [1] * 20
+                for byte in b"Hello from PyHantek!\r\n":
+                    bits += [0] + [(byte >> k) & 1 for k in range(8)] + [1, 1]
+                bits += [1] * 200
+                self._patterns[name] = (np.array(bits, np.uint8),)
+            elif name == "i2c":
+                scl, sda = [], []
+
+                def put(c, d, k=1):
+                    scl.extend([c] * k)
+                    sda.extend([d] * k)
+
+                put(1, 1, 8)
+                for addr, data, read in ((0x48, b"\x00", False), (0x48, b"\x1a\x80", True)):
+                    put(1, 0, 2)  # START
+                    put(0, 0, 1)
+                    for byte in [(addr << 1) | int(read)] + list(data):
+                        for bit in [(byte >> (7 - k)) & 1 for k in range(8)] + [0]:
+                            put(0, bit)
+                            put(1, bit, 2)
+                            put(0, bit)
+                    put(0, 0)
+                    put(1, 0, 2)
+                    put(1, 1, 6)  # STOP
+                put(1, 1, 60)
+                self._patterns[name] = (np.array(scl, np.uint8), np.array(sda, np.uint8))
+            elif name == "spi":
+                clk, mosi = [], []
+                for byte in b"\x9f\x00\xef\x40\x18":
+                    for k in range(8):
+                        b = (byte >> (7 - k)) & 1
+                        clk += [0, 1]
+                        mosi += [b, b]
+                    clk += [0] * 4
+                    mosi += [0] * 4
+                clk += [0] * 60
+                mosi += [0] * 60
+                self._patterns[name] = (np.array(clk, np.uint8), np.array(mosi, np.uint8))
+        return self._patterns[name]
+
+    def _signals(self, t):
+        """Analog test signals in volts for CH1/CH2."""
+        square = np.where((t * self.calfreq) % 1.0 < 0.5, 2.0, 0.0)
+        if self.signal == "uart":
+            (pat,) = self._pattern("uart")
+            idx = (t * 115200).astype(np.int64) % len(pat)
+            return pat[idx] * 3.3, square
+        if self.signal == "i2c":
+            scl, sda = self._pattern("i2c")
+            idx = (t * 100e3 * 4).astype(np.int64) % len(scl)  # 4 steps per 100 kHz clock
+            return scl[idx] * 3.3, sda[idx] * 3.3
+        if self.signal == "spi":
+            clk, mosi = self._pattern("spi")
+            idx = (t * 1e6 * 2).astype(np.int64) % len(clk)  # 2 steps per 1 MHz clock
+            return clk[idx] * 3.3, mosi[idx] * 3.3
+        if self.signal == "lissajous":
+            return 1.5 * np.sin(2 * np.pi * 1000 * t), 1.5 * np.sin(2 * np.pi * 1500 * t + 0.6)
+        sine = 1.5 * np.sin(2 * np.pi * 1000 * t) + 0.25 * np.sin(2 * np.pi * 3000 * t + 0.4)
+        return sine, square
+
     def _raw_rate(self) -> float:
         rid = self.rate_id
         return rid * 1e6 if rid < 100 else (rid - 100) * 1e4
@@ -343,10 +411,8 @@ class DemoDevice:
         t0 = self.t + self.rng.uniform(0, 1e-3)
         t = t0 + np.arange(n) / rate
         self.t = t[-1]
-        sine = 1.5 * np.sin(2 * np.pi * 1000 * t) + 0.25 * np.sin(2 * np.pi * 3000 * t + 0.4)
-        square = np.where((t * self.calfreq) % 1.0 < 0.5, 2.0, 0.0)
         out = np.empty((n, self.channels), dtype=np.uint8)
-        for ch, sig in enumerate((sine, square)[: self.channels]):
+        for ch, sig in enumerate(self._signals(t)[: self.channels]):
             scale = self.model.voltage_scale[self.gain_index[ch]]
             noisy = sig + self.rng.normal(0, 0.012, n)
             out[:, ch] = np.clip(np.round(noisy * scale + 128), 0, 255).astype(np.uint8)

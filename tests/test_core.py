@@ -165,3 +165,16 @@ def test_frequency_with_two_periods_on_screen():
         x = np.sin(2 * np.pi * (1000 * t + phase))
         m = measure(x, sr)
         assert m.freq == pytest.approx(1000, rel=0.01), phase
+
+
+def test_trigger_hysteresis_ignores_noise_on_opposite_edge():
+    rng = np.random.default_rng(3)
+    sr = 2e6
+    t = np.arange(20000) / sr
+    for _ in range(30):
+        phase = rng.uniform(0, 1)
+        x = 1.5 * np.sin(2 * np.pi * (1000 * t + phase)) + rng.normal(0, 0.012, len(t))
+        i = find_trigger(x, 0.0, True, 5000, 15000)
+        assert i is not None
+        # must be on a rising edge: the clean signal's slope is positive there
+        assert np.cos(2 * np.pi * (1000 * t[i] + phase)) > 0

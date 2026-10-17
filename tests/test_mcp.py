@@ -135,3 +135,51 @@ def test_autoset_and_screenshot(client):
     assert r["measurements"]["channels"]["CH1"]["freq"] == pytest.approx(1000, rel=0.02)
     img = client.call("screenshot")
     assert img["type"] == "image" and img["mimeType"] == "image/png"
+
+
+def test_math_expression_over_mcp(client):
+    client.call("set_horizontal", seconds_per_div=500e-6)
+    r = client.call("set_math", enabled=True, expression="diff(lowpass(ch1, fs / 50))", volts_per_div=1e4)
+    assert r["unit"] == "V/s"
+    m = client.call("get_measurements")
+    # demo CH1 = 1.5 sin(wt) + 0.25 sin(3wt + 0.4): peak slope between 1.5w and 2.25w
+    assert 1.4 * 2 * np.pi * 1000 < m["channels"]["MATH"]["vmax"] < 2.4 * 2 * np.pi * 1000
+    bad = client.call("set_math", expression="__import__('os')")
+    assert "_error" in bad
+    client.call("set_math", enabled=False, expression="ch1 + ch2")
+
+
+def test_decoders_over_mcp(client):
+    client.call("set_demo_signal", signal="uart")
+    client.call("set_horizontal", seconds_per_div=500e-6)
+    client.call("set_decoder", enabled=True, protocol="UART", uart_channel="CH1", baud=0, format="ASCII")
+    d = client.call("get_decoded")
+    assert d["baud"] == 115200
+    assert "PyHantek" in d["text"] or "Hello" in d["text"]
+
+    client.call("set_demo_signal", signal="i2c")
+    client.call("set_horizontal", seconds_per_div=50e-6)
+    client.call("set_decoder", protocol="I2C", clock_channel="CH1", format="Hex")
+    d = client.call("get_decoded")
+    texts = [i["text"] for i in d["items"]]
+    assert "W 0x48" in texts or "R 0x48" in texts
+
+    client.call("set_demo_signal", signal="spi")
+    client.call("set_horizontal", seconds_per_div=5e-6)
+    client.call("set_decoder", protocol="SPI", clock_channel="CH1", format="Hex")
+    d = client.call("get_decoded")
+    assert {0x9F, 0xEF} <= {i["value"] for i in d["items"]}
+    client.call("set_decoder", enabled=False)
+    client.call("set_demo_signal", signal="sine")
+    client.call("set_horizontal", seconds_per_div=500e-6)
+
+
+def test_display_extras_over_mcp(client):
+    client.call("set_horizontal", seconds_per_div=500e-6)
+    r = client.call("set_display", xy_mode=True, persistence_s=1.7, zoom=True, zoom_start_div=6, zoom_end_div=4,
+                    spectrum_view="Both", spectrogram_channel="CH2")
+    assert r["xy_mode"] and r["persistence_s"] == 2.0 and r["zoom_div"] == [4, 6] and r["spectrum"]
+    assert r["zoom_seconds_per_div"] == pytest.approx(500e-6 * 0.2)
+    img = client.call("screenshot")
+    assert img["type"] == "image"
+    client.call("set_display", xy_mode=False, persistence_s=0, zoom=False, spectrum=False)

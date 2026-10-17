@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSplitter,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QToolBar,
@@ -33,10 +34,14 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..acquisition import Acquisition, Frame
-from ..processing import math_channel, measure, minmax_decimate, si_format, sinc_interpolate, spectrum
+from ..device import DemoDevice
+from ..decoders import DecodeResult, run_decoder
+from ..mathexpr import MathError, compile_expr, evaluate, label_for, unit_for
+from ..processing import measure, minmax_decimate, si_format, sinc_interpolate, spectrum
 from ..settings import CH_NAMES, DIVS_X, DIVS_Y, TIMEBASES, VDIVS, Settings
 from . import theme
 from .controls import ControlPanel
+from .extra_views import SpectrogramView, ZoomView
 from .scope_view import ScopeView, SpectrumView
 
 MEAS_COLUMNS = [
@@ -96,6 +101,9 @@ class MainWindow(QMainWindow):
         self.frame_times: deque = deque(maxlen=30)
         self.autoset_stage = 0
         self.device = device
+        self.last_decode: DecodeResult | None = None
+        self.math_error = ""
+        self._math_cache = (None, None)
 
         self.setWindowTitle("PyHantek")
         self.resize(1360, 860)
@@ -176,6 +184,13 @@ class MainWindow(QMainWindow):
         self.device_chip = QLabel()
         self.device_chip.setStyleSheet(f"color:{theme.MUTED}; padding: 0 12px;")
         tb.addWidget(self.device_chip)
+        from PySide6.QtWidgets import QComboBox
+
+        self.demo_combo = QComboBox()
+        self.demo_combo.addItems(["Demo: sine + square", "Demo: UART", "Demo: I²C", "Demo: SPI", "Demo: Lissajous"])
+        self.demo_combo.setToolTip("Simulated test signals (only with the demo device)")
+        self.demo_combo.currentIndexChanged.connect(lambda i: self.set_demo_signal(DemoDevice.SIGNALS[i]))
+        self.demo_combo_action = tb.addWidget(self.demo_combo)
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(spacer)
@@ -224,15 +239,19 @@ class MainWindow(QMainWindow):
         self.info_bar.setStyleSheet("padding: 0 4px; font-family: monospace;")
         vl.addWidget(self.info_bar)
         self.scope = ScopeView()
+        self.zoom = ZoomView()
         self.spectrum = SpectrumView()
+        self.spectrogram = SpectrogramView()
         self.table = self._build_table()
+        self.decoded = self._build_decoded_table()
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.table, "Measurements")
+        self.tabs.addTab(self.decoded, "Decoded")
+        self.tabs.setFixedHeight(24 * 3 + 30 + 34)
         self.splitter = QSplitter(Qt.Vertical)
-        self.splitter.addWidget(self.scope)
-        self.splitter.addWidget(self.spectrum)
-        self.splitter.addWidget(self.table)
-        self.splitter.setStretchFactor(0, 5)
-        self.splitter.setStretchFactor(1, 2)
-        self.splitter.setStretchFactor(2, 0)
+        for i, w in enumerate((self.scope, self.zoom, self.spectrum, self.spectrogram, self.tabs)):
+            self.splitter.addWidget(w)
+            self.splitter.setStretchFactor(i, (5, 3, 2, 2, 0)[i])
         self.splitter.setChildrenCollapsible(False)
         vl.addWidget(self.splitter, 1)
 
@@ -263,6 +282,8 @@ class MainWindow(QMainWindow):
 
         self.panel.changed.connect(self._settings_changed)
         self.panel.level_to_50.connect(self.level_to_50)
+        self.panel.clear_persistence.connect(lambda: self.scope.phosphor.clear())
+        self.scope.zoom_moved.connect(self._on_zoom_moved)
         self.scope.trigger_level_moved.connect(self._on_level_dragged)
         self.scope.trigger_position_moved.connect(self._on_position_dragged)
         self.scope.offset_moved.connect(self._on_offset_dragged)
@@ -298,7 +319,6 @@ class MainWindow(QMainWindow):
         t.setSelectionMode(QAbstractItemView.NoSelection)
         t.setFocusPolicy(Qt.NoFocus)
         t.setShowGrid(False)
-        t.setFixedHeight(24 * 3 + 30)
         for r in range(3):
             for c in range(len(MEAS_COLUMNS)):
                 item = QTableWidgetItem("—")
@@ -308,6 +328,18 @@ class MainWindow(QMainWindow):
             hdr = QTableWidgetItem(["CH1", "CH2", "Math"][r])
             hdr.setForeground(pg_color(theme.CH_COLORS[r]))
             t.setVerticalHeaderItem(r, hdr)
+        return t
+
+    def _build_decoded_table(self):
+        t = QTableWidget(0, 4)
+        t.setHorizontalHeaderLabels(["Time", "Type", "Value", "Info"])
+        t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        t.horizontalHeader().setStretchLastSection(True)
+        t.verticalHeader().setVisible(False)
+        t.verticalHeader().setDefaultSectionSize(22)
+        t.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        t.setSelectionBehavior(QAbstractItemView.SelectRows)
+        t.setShowGrid(False)
         return t
 
     # ------------------------------------------------------------ device
@@ -332,6 +364,7 @@ class MainWindow(QMainWindow):
         self.acq.calibration_done.connect(self._on_calibration_done)
         self.acq.start()
         self._on_running(True)
+        self.demo_combo_action.setVisible(device.is_demo)
         if device.is_demo:
             self.banner.show_message(
                 "No Hantek scope found — showing simulated signals. Plug in a DSO-6022BE/BL, DSO-2020 or DSO-6021 and press Connect.",
@@ -342,6 +375,21 @@ class MainWindow(QMainWindow):
             self.banner.hide()
             if not self.acq.cal.from_eeprom:
                 self.statusBar().showMessage("No calibration in EEPROM — consider running Calibrate", 8000)
+
+    def set_demo_signal(self, name: str):
+        if not self.device.is_demo:
+            return
+        self.device.signal = name
+        i = DemoDevice.SIGNALS.index(name)
+        if self.demo_combo.currentIndex() != i:
+            self.demo_combo.blockSignals(True)
+            self.demo_combo.setCurrentIndex(i)
+            self.demo_combo.blockSignals(False)
+        self.scope.phosphor.clear()
+        self.spectrogram.clear()
+        self.settings_gen += 1  # frames from the old signal are stale
+        if self.acq:
+            self.acq.update_settings(self.settings, self.settings_gen)
 
     def _reconnect(self):
         if self.reconnect_cb is None:
@@ -363,7 +411,16 @@ class MainWindow(QMainWindow):
             self._channel_count = s.channel_count()
             self.panel._fill_rates()
         self.scope.apply_settings(s)
-        self.spectrum.setVisible(s.spectrum_enabled)
+        self.spectrum.setVisible(s.spectrum_enabled and s.spectrum_view in ("Spectrum", "Both"))
+        self.spectrogram.setVisible(s.spectrum_enabled and s.spectrum_view in ("Spectrogram", "Both"))
+        self.zoom.setVisible(s.zoom_enabled and not s.xy_mode)
+        if s.zoom_enabled:
+            self.zoom.set_region(s.zoom_start, s.zoom_end, s.timebase)
+        self.scope.phosphor.set_visible(s.persistence != 0)
+        self.scope.phosphor.clear()
+        if not s.decoder.enabled:
+            self.zoom.bus.clear()
+            self.last_decode = None
         self.settings_gen += 1
         if self.acq:
             self.acq.update_settings(s, self.settings_gen)
@@ -375,6 +432,11 @@ class MainWindow(QMainWindow):
         self.panel.trig_level.setValue(v)
         self.panel.trig_level.blockSignals(False)
         self._settings_changed()
+
+    def _on_zoom_moved(self, a, b):
+        self.settings.zoom_start, self.settings.zoom_end = round(a, 3), round(b, 3)
+        self.zoom.set_region(a, b, self.settings.timebase)
+        self._redraw()
 
     def _on_position_dragged(self, p):
         self.settings.trigger.position = p
@@ -531,15 +593,22 @@ class MainWindow(QMainWindow):
             self.avg_buf.clear()
 
         math_v = None
-        if s.math_enabled and visible[0] is not None and visible[1] is not None:
-            math_v = math_channel(s.math_mode, visible[0], visible[1])
+        if s.math_enabled:
+            t_rel = (x - s.trigger.position * DIVS_X) * s.timebase
+            math_v = self.compute_math(visible[0], visible[1], f.samplerate, t_rel)
 
         volts = [visible[0] if s.channels[0].enabled else None, visible[1] if s.channels[1].enabled else None, math_v]
         traces = []
+        full_traces = []
         dots = s.interpolation == "Dots"
         for i, v in enumerate(volts):
+            if s.xy_mode:
+                traces.append(None)
+                full_traces.append(None)
+                continue
             if v is None or len(v) < 2:
                 traces.append(None)
+                full_traces.append(None)
                 continue
             vdiv = s.channels[i].vdiv if i < 2 else s.math_vdiv
             off = s.channels[i].offset if i < 2 else s.math_offset
@@ -549,11 +618,29 @@ class MainWindow(QMainWindow):
                 vv = sinc_interpolate(v, factor)
                 xx = x[0] + np.arange(len(vv)) * (x[1] - x[0]) / factor
             y = np.clip(vv / vdiv + off, -DIVS_Y / 2 - 0.02, DIVS_Y / 2 + 0.02)
+            full_traces.append((xx, y))
             if not dots:
                 xx, y = minmax_decimate(xx, y, 1500)
             traces.append((xx, y))
         self.scope.set_traces(traces, dots=dots)
         self.last_view = (x, volts, f.samplerate)
+
+        # XY mode: CH1 horizontal, CH2 vertical, using the on-screen time window
+        xy = None
+        if s.xy_mode and visible[0] is not None and visible[1] is not None:
+            on = (x >= 0) & (x <= DIVS_X)
+            a, b = visible[0][on[: len(visible[0])]], visible[1][on[: len(visible[1])]]
+            k = min(len(a), len(b))
+            xy = (np.clip(DIVS_X / 2 + a[:k] / s.channels[0].vdiv + s.channels[0].offset, -0.02, DIVS_X + 0.02),
+                  np.clip(b[:k] / s.channels[1].vdiv + s.channels[1].offset, -DIVS_Y / 2 - 0.02, DIVS_Y / 2 + 0.02))
+        self.scope.set_xy(xy)
+
+        if new_frame and s.persistence != 0:
+            self.scope.phosphor.add([xy] if s.xy_mode else full_traces, s.persistence)
+        if s.zoom_enabled and not s.xy_mode:
+            self.zoom.set_traces(full_traces)
+        if s.decoder.enabled and not s.xy_mode:
+            self._decode(f, new_frame)
 
         # info line
         def chip(color, text, warn=False):
@@ -569,8 +656,15 @@ class MainWindow(QMainWindow):
                 inv = " INV" if ch.invert else ""
                 parts.append(chip(theme.CH_COLORS[i], f"{CH_NAMES[i]} {si_format(ch.vdiv, 'V')}/div {ch.coupling}{inv}{clip}", bool(clip)))
         if s.math_enabled:
-            from ..settings import MATH_MODES
-            parts.append(chip(theme.CH_COLORS[2], f"M {MATH_MODES[s.math_mode]} {si_format(s.math_vdiv, 'V')}/div"))
+            if self.math_error:
+                parts.append(chip(theme.BAD, f"M error: {self.math_error}", True))
+            else:
+                unit = unit_for(s.math_expr) or "u"
+                parts.append(chip(theme.CH_COLORS[2], f"M {label_for(s.math_expr)} {si_format(s.math_vdiv, unit)}/div"))
+        if s.xy_mode:
+            parts.append(chip("#4ade80", "XY"))
+        if s.persistence:
+            parts.append(chip(theme.MUTED, "Persist " + ("∞" if s.persistence < 0 else f"{s.persistence:g} s")))
         parts.append(chip(theme.TEXT, f"H {si_format(s.timebase, 's')}/div · {si_format(f.samplerate, 'S/s')}"))
         if s.trigger.mode != "Roll":
             arrow = "↗" if s.trigger.slope == "Rising" else "↘"
@@ -596,7 +690,7 @@ class MainWindow(QMainWindow):
                 if unit == "%":
                     item.setText(f"{val * 100:.1f} %" if math.isfinite(val) else "—")
                 else:
-                    u = "V²" if r == 2 and s.math_mode == 3 and unit == "V" else unit
+                    u = ((unit_for(s.math_expr) or "u") if unit == "V" else unit) if r == 2 else unit
                     item.setText(si_format(val, u))
         if f.clipped[0] or f.clipped[1]:
             for r in range(2):
@@ -610,15 +704,83 @@ class MainWindow(QMainWindow):
         # spectrum on the full record for best resolution
         if s.spectrum_enabled and new_frame:
             full = list(f.data)
-            if s.math_enabled and full[0] is not None and full[1] is not None:
-                full.append(math_channel(s.math_mode, full[0], full[1]))
-            else:
-                full.append(None)
-            spectra = []
-            for i in range(3):
-                on = s.spectrum_channels[i] and (s.channels[i].enabled if i < 2 else s.math_enabled)
-                spectra.append(spectrum(full[i], f.samplerate, s.spectrum_window) if on and full[i] is not None else None)
-            self.spectrum.set_spectra(spectra, f.samplerate / 2)
+            full.append(self.compute_math(full[0], full[1], f.samplerate) if s.math_enabled else None)
+            if s.spectrum_view in ("Spectrum", "Both"):
+                spectra = []
+                for i in range(3):
+                    on = s.spectrum_channels[i] and (s.channels[i].enabled if i < 2 else s.math_enabled)
+                    spectra.append(spectrum(full[i], f.samplerate, s.spectrum_window) if on and full[i] is not None else None)
+                self.spectrum.set_spectra(spectra, f.samplerate / 2)
+            if s.spectrum_view in ("Spectrogram", "Both"):
+                i = s.spectrogram_channel
+                if full[i] is not None:
+                    fr, db = spectrum(full[i], f.samplerate, s.spectrum_window)
+                    if len(fr) > 2:
+                        name = ["CH1", "CH2", "Math"][i]
+                        self.spectrogram.add(fr[1:], db[1:], f.samplerate / 2, f"Waterfall · {name}", theme.CH_COLORS[i])
+
+    # ------------------------------------------------------------ math & decoding
+
+    def compute_math(self, a, b, sr, t=None):
+        """Evaluate the math formula; returns None (and records the error) when it cannot be computed."""
+        expr = self.settings.math_expr
+        cached_expr, compiled = self._math_cache
+        try:
+            if cached_expr != expr:
+                compiled = compile_expr(expr)
+                self._math_cache = (expr, compiled)
+            out = evaluate(compiled, a, b, sr, t)
+            self.math_error = ""
+            return out
+        except MathError as exc:
+            self.math_error = str(exc)
+            return None
+
+    def _decode(self, f: Frame, new_frame: bool):
+        s = self.settings
+        if new_frame or self.last_decode is None:
+            self.last_decode = run_decoder(s.decoder, f.data, f.samplerate)
+            self._fill_decoded(f)
+        res = self.last_decode
+        sr = f.samplerate
+        n = max((len(d) for d in f.data if d is not None), default=1)
+
+        def to_x(i):
+            if f.roll:
+                return i / n * DIVS_X
+            return (i - f.trigger_index) / sr / s.timebase + s.trigger.position * DIVS_X
+
+        items = [(to_x(a.start), to_x(a.end), a.kind, a.text) for a in res.annotations]
+        proto = {"I2C": "I²C"}.get(s.decoder.protocol, s.decoder.protocol)
+        extra = res.message or (f"{res.params['baud']:g} baud" if "baud" in res.params else "")
+        title = f"{proto}" + (f" · {extra}" if extra else "") + f" · {len(res.annotations)} items"
+        self.scope.bus.set_annotations(items, title, self.scope.px_per_div())
+        if s.zoom_enabled:
+            a, b = s.zoom_start, s.zoom_end
+            self.zoom.bus.set_annotations(items, proto, self.zoom.vb.width() / max(b - a, 1e-9), (a, b))
+
+    def _fill_decoded(self, f: Frame):
+        res = self.last_decode
+        t = self.decoded
+        rows = res.annotations[:1000]
+        t.setRowCount(len(rows) if rows else 1)
+        if not rows:
+            t.setItem(0, 0, QTableWidgetItem(""))
+            t.setItem(0, 1, QTableWidgetItem(""))
+            t.setItem(0, 2, QTableWidgetItem(res.message or "nothing decoded"))
+            t.setItem(0, 3, QTableWidgetItem(""))
+            return
+        sr = f.samplerate
+        from .extra_views import KIND_COLORS
+
+        for r, a in enumerate(rows):
+            tt = (a.start - f.trigger_index) / sr if not f.roll else a.start / sr
+            cells = [si_format(tt, "s"), a.kind, a.text, a.info]
+            for c, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if c == 2:
+                    item.setForeground(pg_color(KIND_COLORS.get(a.kind, "#ffffff")))
+                t.setItem(r, c, item)
 
     # ------------------------------------------------------------ autoset
 

@@ -22,8 +22,9 @@ import numpy as np
 from mcp.server.mcpserver import Image, MCPServer
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QObject, Qt, Signal
 
-from .processing import math_channel, measure, spectrum
-from .settings import INTERPOLATIONS, MATH_MODES, NOISE_REJECT, PROBES, TIMEBASES, VDIVS, WINDOWS
+from .mathexpr import compile_expr, unit_for
+from .processing import measure, spectrum
+from .settings import NOISE_REJECT, PERSISTENCE, PROBES, TIMEBASES, VDIVS
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +36,8 @@ running in the PyHantek app. All values use SI base units: seconds, volts, hertz
 The screen is 10 horizontal divisions by 8 vertical divisions.
 Typical flow: get_status -> configure with set_channel / set_horizontal / set_trigger (or autoset)
 -> get_measurements / get_waveform / get_spectrum / screenshot.
+Extras: set_math(expression=...) for formulas, set_decoder + get_decoded for UART/I2C/SPI,
+set_display for XY mode, persistence, zoom window and spectrogram.
 Settings snap to the nearest valid value (1-2-5 steps) and the applied value is returned.
 Measurement tools wait for a frame captured with the latest settings.
 In Normal or Single trigger mode no frame arrives until the signal crosses the trigger level.
@@ -181,7 +184,7 @@ class McpServer:
 
         def settings_dict():
             s = asdict(win.settings)
-            s["math_mode_name"] = MATH_MODES[win.settings.math_mode]
+            s["math_unit"] = unit_for(win.settings.math_expr) or "unknown"
             return s
 
         # ---------------- status
@@ -332,27 +335,30 @@ class McpServer:
         @mcp.tool()
         async def set_math(
             enabled: bool | None = None,
-            function: Literal["CH1 + CH2", "CH1 - CH2", "CH2 - CH1", "CH1 * CH2"] | None = None,
+            expression: str | None = None,
             volts_per_div: float | None = None,
             position_div: float | None = None,
         ) -> dict:
-            """Configure the math trace (computed from CH1 and CH2)."""
+            """Configure the math trace. expression is a formula over ch1, ch2 (volts), t (s from trigger), fs.
+            Examples: "ch1 - ch2", "ch1 * ch2" (power), "diff(ch1)", "integ(ch1)", "lowpass(ch1, 10e3)",
+            "highpass(ch1, 100)", "avg(ch1, 10)", "sqrt(ch1**2 + ch2**2)", "ch1 > 1.5" (logic 0/1).
+            Functions: abs sqrt exp log log10 sin cos tan sign floor ceil min max clip diff integ avg
+            lowpass highpass mean rms dc. volts_per_div is the math trace scale in its own unit per division."""
 
             def work():
                 s = win.settings
+                if expression is not None:
+                    compile_expr(expression)  # raises a readable MathError for bad input
+                    s.math_expr = expression.strip()
                 if enabled is not None:
                     s.math_enabled = enabled
-                if function is not None:
-                    names = [m.replace("−", "-").replace("×", "*") for m in MATH_MODES]
-                    s.math_mode = names.index(function)
                 if volts_per_div is not None:
-                    s.math_vdiv = _nearest(list(VDIVS) + [10.0, 20.0, 50.0], volts_per_div)
+                    s.math_vdiv = _nearest(list(VDIVS) + [10.0, 20.0, 50.0, 100.0, 1e3, 1e4, 1e5], volts_per_div)
                 if position_div is not None:
                     s.math_offset = max(-4.0, min(4.0, float(position_div)))
                 self._apply()
-                fn = MATH_MODES[s.math_mode].replace("−", "-").replace("×", "*")
-                return {"enabled": s.math_enabled, "function": fn, "volts_per_div": s.math_vdiv,
-                        "position_div": s.math_offset}
+                return {"enabled": s.math_enabled, "expression": s.math_expr, "unit": unit_for(s.math_expr) or "unknown",
+                        "per_div": s.math_vdiv, "position_div": s.math_offset}
 
             return await self.gui(work)
 
@@ -363,8 +369,18 @@ class McpServer:
             averaging: Literal[1, 2, 4, 8, 16, 32] | None = None,
             interpolation: Literal["Linear", "Sin(x)/x", "Dots"] | None = None,
             cursors: bool | None = None,
+            xy_mode: bool | None = None,
+            persistence_s: float | None = None,
+            zoom: bool | None = None,
+            zoom_start_div: float | None = None,
+            zoom_end_div: float | None = None,
+            spectrum_view: Literal["Spectrum", "Spectrogram", "Both"] | None = None,
+            spectrogram_channel: CHANNEL | None = None,
         ) -> dict:
-            """Display options: spectrum view, FFT window, trace averaging, drawing style and cursors."""
+            """Display options. xy_mode plots CH2 (vertical) against CH1 (horizontal).
+            persistence_s keeps fading older traces (0 = off, -1 = infinite; snaps to 0.2/0.5/1/2/5 s).
+            zoom shows a magnified window of divisions zoom_start_div..zoom_end_div (0..10) of the main screen.
+            spectrum_view picks the FFT plot, a spectrogram (waterfall) of spectrogram_channel, or both."""
 
             def work():
                 s = win.settings
@@ -378,9 +394,34 @@ class McpServer:
                     s.interpolation = interpolation
                 if cursors is not None:
                     s.cursors = cursors
+                if xy_mode is not None:
+                    s.xy_mode = xy_mode
+                if persistence_s is not None:
+                    p = float(persistence_s)
+                    s.persistence = 0.0 if p == 0 else -1.0 if p < 0 else min((x for x in PERSISTENCE if x > 0), key=lambda x: abs(x - p))
+                if zoom is not None:
+                    s.zoom_enabled = zoom
+                if zoom_start_div is not None or zoom_end_div is not None:
+                    a = s.zoom_start if zoom_start_div is None else zoom_start_div
+                    b = s.zoom_end if zoom_end_div is None else zoom_end_div
+                    a, b = sorted((max(0.0, min(10.0, float(a))), max(0.0, min(10.0, float(b)))))
+                    if b - a < 0.05:
+                        raise ValueError("zoom window must be at least 0.05 divisions wide")
+                    s.zoom_start, s.zoom_end = a, b
+                if spectrum_view is not None:
+                    s.spectrum_view = spectrum_view
+                    if spectrum is None:
+                        s.spectrum_enabled = True
+                if spectrogram_channel is not None:
+                    s.spectrogram_channel = {"CH1": 0, "CH2": 1, "MATH": 2}[spectrogram_channel]
                 self._apply()
                 return {"spectrum": s.spectrum_enabled, "spectrum_window": s.spectrum_window, "averaging": s.averaging,
-                        "interpolation": s.interpolation, "cursors": s.cursors}
+                        "interpolation": s.interpolation, "cursors": s.cursors, "xy_mode": s.xy_mode,
+                        "persistence_s": s.persistence, "zoom": s.zoom_enabled,
+                        "zoom_div": [s.zoom_start, s.zoom_end],
+                        "zoom_seconds_per_div": s.timebase * (s.zoom_end - s.zoom_start) / 10,
+                        "spectrum_view": s.spectrum_view,
+                        "spectrogram_channel": ["CH1", "CH2", "MATH"][s.spectrogram_channel]}
 
             return await self.gui(work)
 
@@ -463,9 +504,9 @@ class McpServer:
                 else:
                     data = list(f.data)
                     if idx == 2:
-                        if data[0] is None or data[1] is None:
-                            return {"error": "math needs both channels"}
-                        v = math_channel(s.math_mode, data[0], data[1])
+                        v = win.compute_math(data[0], data[1], f.samplerate)
+                        if v is None:
+                            return {"error": f"math: {win.math_error}"}
                     else:
                         v = data[idx]
                     if v is None:
@@ -477,7 +518,7 @@ class McpServer:
                 sel = np.linspace(0, n - 1, m).round().astype(int)
                 return {
                     "channel": channel,
-                    "unit": "V^2" if idx == 2 and s.math_mode == 3 else "V",
+                    "unit": (unit_for(s.math_expr) or "unknown") if idx == 2 else "V",
                     "samplerate": sr,
                     "samples_total": n,
                     "samplerate_effective": _num(sr * (m - 1) / max(n - 1, 1)),
@@ -508,14 +549,110 @@ class McpServer:
                 s = win.settings
                 idx = {"CH1": 0, "CH2": 1, "MATH": 2}[channel]
                 if idx == 2:
-                    if f.data[0] is None or f.data[1] is None:
-                        return {"error": "math needs both channels"}
-                    v = math_channel(s.math_mode, f.data[0], f.data[1])
+                    v = win.compute_math(f.data[0], f.data[1], f.samplerate)
+                    if v is None:
+                        return {"error": f"math: {win.math_error}"}
                 else:
                     v = f.data[idx]
                 if v is None:
                     return {"error": f"{channel} is not enabled"}
                 return _analyse_spectrum(v, f.samplerate, window, peaks)
+
+            return await self.gui(work)
+
+        @mcp.tool()
+        async def set_decoder(
+            enabled: bool | None = None,
+            protocol: Literal["UART", "I2C", "SPI"] | None = None,
+            uart_channel: Literal["CH1", "CH2"] | None = None,
+            baud: float | None = None,
+            data_bits: int | None = None,
+            parity: Literal["None", "Even", "Odd"] | None = None,
+            stop_bits: Literal[1, 1.5, 2] | None = None,
+            inverted: bool | None = None,
+            clock_channel: Literal["CH1", "CH2"] | None = None,
+            spi_edge: Literal["Rising", "Falling"] | None = None,
+            spi_bits: int | None = None,
+            spi_msb_first: bool | None = None,
+            threshold_auto: bool | None = None,
+            threshold_volts: float | None = None,
+            format: Literal["Hex", "Dec", "ASCII", "Bin"] | None = None,
+        ) -> dict:
+            """Configure the serial protocol decoder.
+            UART uses one channel (baud 0 = auto detect). I2C uses clock_channel as SCL and the other channel as SDA.
+            SPI uses clock_channel as CLK and the other as data; words are framed by gaps in the clock (no chip select).
+            threshold_auto=True puts the logic threshold at the middle of the signal; threshold_volts sets a fixed one.
+            The sample rate must be at least ~4x the bit rate: pick a fast enough timebase."""
+
+            def work():
+                d = win.settings.decoder
+                for name, val in (("enabled", enabled), ("protocol", protocol), ("uart_bits", data_bits),
+                                  ("uart_parity", parity), ("uart_inverted", inverted), ("spi_edge", spi_edge),
+                                  ("spi_bits", spi_bits), ("spi_msb_first", spi_msb_first), ("format", format)):
+                    if val is not None:
+                        setattr(d, name, val)
+                if uart_channel is not None:
+                    d.uart_channel = 0 if uart_channel == "CH1" else 1
+                if clock_channel is not None:
+                    d.clock_channel = 0 if clock_channel == "CH1" else 1
+                if baud is not None:
+                    d.uart_baud = max(0.0, float(baud))
+                if stop_bits is not None:
+                    d.uart_stop = float(stop_bits)
+                if threshold_volts is not None:
+                    d.threshold_auto = False
+                    d.threshold = float(threshold_volts)
+                if threshold_auto is not None:
+                    d.threshold_auto = threshold_auto
+                self._apply()
+                return asdict(d)
+
+            return await self.gui(work)
+
+        @mcp.tool()
+        async def set_demo_signal(signal: Literal["sine", "uart", "i2c", "spi", "lissajous"]) -> dict:
+            """Only for the simulated demo device: choose the test signals.
+            sine = CH1 1 kHz distorted sine + CH2 calibration square; uart = CH1 115200 baud text;
+            i2c = CH1 SCL / CH2 SDA at 100 kHz; spi = CH1 CLK / CH2 MOSI at 1 MHz; lissajous = 1 kHz / 1.5 kHz sines."""
+
+            def work():
+                if not win.device.is_demo:
+                    raise ValueError("a real scope is connected; demo signals are not available")
+                win.set_demo_signal(signal)
+                return {"demo_signal": signal}
+
+            return await self.gui(work)
+
+        @mcp.tool()
+        async def get_decoded(max_items: int = 200, fresh: bool = True) -> dict:
+            """Decoded protocol items from the latest capture (time relative to the trigger point).
+            Also returns the decoded bytes as hex and as text for UART/SPI."""
+            if fresh and await self.gui(lambda: bool(win.acq and win.acq.running)):
+                await self.fresh_frame(5.0)
+
+            def work():
+                s = win.settings
+                if not s.decoder.enabled:
+                    return {"error": "decoder is off; call set_decoder(enabled=True, protocol=...)"}
+                f = win.last_frame
+                res = win.last_decode
+                if f is None or res is None:
+                    return {"error": "no data yet"}
+                sr = f.samplerate
+                items = []
+                for a in res.annotations[: max(1, min(int(max_items), 2000))]:
+                    t0 = (a.start - f.trigger_index) / sr if not f.roll else a.start / sr
+                    items.append({"time_s": _num(t0), "duration_s": _num((a.end - a.start) / sr), "kind": a.kind,
+                                  "text": a.text, "value": a.value, **({"info": a.info} if a.info else {})})
+                values = [a.value for a in res.annotations if a.kind in ("data", "error") and a.value is not None]
+                out = {"protocol": s.decoder.protocol, "samplerate": sr, "count": len(res.annotations), "items": items}
+                if res.message:
+                    out["message"] = res.message
+                out.update({k: v for k, v in res.params.items()})
+                if values and max(values) < 256:
+                    out["bytes_hex"] = " ".join(f"{v:02X}" for v in values)
+                    out["text"] = "".join(chr(v) if 32 <= v < 127 or v in (9, 10, 13) else "." for v in values)
+                return out
 
             return await self.gui(work)
 
@@ -556,7 +693,7 @@ class McpServer:
             if v is None:
                 continue
             m = measure(v[on[: len(v)]], sr, f.lsb[i] if i < 2 else 0.0)
-            unit = "V^2" if i == 2 and win.settings.math_mode == 3 else "V"
+            unit = (unit_for(win.settings.math_expr) or "unknown") if i == 2 else "V"
             d = {k: _num(val) for k, val in asdict(m).items()}
             d["unit"] = unit
             if i < 2:

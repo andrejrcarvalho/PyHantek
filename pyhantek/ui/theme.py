@@ -91,6 +91,11 @@ QHeaderView::section {{ background: {SURFACE}; color: {MUTED}; border: none; bor
     padding: 4px 8px; font-size: 11px; font-weight: 600; }}
 QTableCornerButton::section {{ background: {SURFACE}; border: none; }}
 
+QTabWidget::pane {{ border: none; }}
+QTabBar::tab {{ background: transparent; color: {MUTED}; padding: 5px 14px; border: none; border-bottom: 2px solid transparent; }}
+QTabBar::tab:selected {{ color: {TEXT}; border-bottom: 2px solid {ACCENT}; }}
+QTabBar::tab:hover {{ color: {TEXT}; }}
+
 QFrame#Banner {{ background: #3a2a0b; border: 1px solid {WARN}; border-radius: 8px; }}
 QFrame#Banner QLabel {{ color: #fde68a; }}
 QMenu {{ background: {SURFACE_2}; border: 1px solid {BORDER}; padding: 4px; }}

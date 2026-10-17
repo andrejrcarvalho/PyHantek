@@ -11,7 +11,7 @@ Built with PySide6, pyqtgraph, pyusb and numpy.
 ```sh
 cd pyhantek
 uv run pyhantek            # uses a connected scope, or the demo device if none is found
-uv run pyhantek --demo     # always use the simulated demo device
+uv run pyhantek --demo     # always use the simulated demo device (toolbar: sine, UART, I²C, SPI, Lissajous)
 uv run pyhantek -vv        # debug logging
 ```
 
@@ -35,8 +35,14 @@ The firmware is uploaded automatically when the scope is plugged in. Outdated fi
 * Roll mode for slow signals: new samples scroll in from the right while the capture is still running
 * Measurements: frequency, period, Vpp, max, min, mean, RMS, AC RMS, duty cycle, rise and fall time
 * FFT spectrum (dBV, log frequency axis) with Hann, Hamming, Blackman, flat-top or rectangular window, and a peak marker
-* Math channel: CH1 + CH2, CH1 − CH2, CH2 − CH1, CH1 × CH2
+* Math channel with formulas, for example `ch1 - ch2`, `ch1 * ch2`, `diff(ch1)`, `integ(ch1)`, `lowpass(ch1, 10e3)`, `sqrt(ch1**2 + ch2**2)` or `ch1 > 1.5`. Formulas are evaluated safely: only whitelisted names and functions are allowed
+* Protocol decoding: UART (auto baud, parity, inverted), I²C (address, R/W, ACK/NAK, repeated start) and SPI (clock plus data, framed by clock gaps). Results appear as a bus lane on screen and in a "Decoded" table
+* XY mode (CH2 against CH1) for Lissajous figures and component curves
+* Persistence: a fading phosphor display from 0.2 s up to infinite, to catch jitter and rare glitches
+* Zoom window: drag a region on the main screen to magnify it in a second view
+* Spectrogram: a scrolling FFT waterfall, next to or instead of the spectrum
 * Cursors (Δt, 1/Δt, ΔV), trace averaging, and linear, sin(x)/x or dot drawing
+* The trigger has hysteresis, so noise on the opposite edge can't fire it
 * Autoset, and an adjustable calibration output frequency (32 Hz to 100 kHz)
 * Offset calibration with grounded inputs. It writes the OpenHantek-compatible ini file and never the EEPROM
 * PNG screenshots (also copied to the clipboard) and CSV export of the visible traces
@@ -66,11 +72,15 @@ claude mcp add --transport http --scope user pyhantek http://127.0.0.1:8765/mcp
 | Tool | What it does |
 | --- | --- |
 | `get_status` | Device, run state, sample rate, all settings and valid ranges |
-| `set_channel` / `set_horizontal` / `set_trigger` / `set_math` / `set_display` | Change settings (values snap to valid 1-2-5 steps) |
+| `set_channel` / `set_horizontal` / `set_trigger` | Change settings (values snap to valid 1-2-5 steps) |
+| `set_math` | Math formula, scale and position |
+| `set_display` | Spectrum, spectrogram, XY mode, persistence, zoom window, averaging, cursors |
 | `run` / `stop` / `single` / `autoset` | Acquisition control |
 | `get_measurements` | Frequency, Vpp, RMS, duty cycle, rise time… for each trace |
 | `get_waveform` | Time/voltage samples of the screen or the whole record |
 | `get_spectrum` | FFT peaks, noise floor and THD |
+| `set_decoder` / `get_decoded` | Protocol decoding (UART/I²C/SPI) and the decoded bytes or text |
+| `set_demo_signal` | Choose the demo device's test signals |
 | `screenshot` | PNG of the scope screen |
 
 Measurement tools wait for a frame captured with the latest settings, so "change something, then measure" never returns stale data.
@@ -85,10 +95,12 @@ pyhantek/
   device.py        USB discovery, FX2 firmware upload, transfers, demo device
   calibration.py   EEPROM calibration and the OpenHantek ini file
   acquisition.py   capture thread: hardware setup, conversion to volts, trigger, roll mode
-  processing.py    trigger search, measurements, FFT, math, decimation
+  processing.py    trigger search, measurements, FFT, decimation
+  mathexpr.py      safe math-channel formulas
+  decoders.py      UART / I²C / SPI decoders
   settings.py      user settings (JSON)
   mcp_server.py    built-in MCP server (AI control over localhost HTTP)
-  ui/              theme, scope and spectrum views, control panel, main window
+  ui/              theme, scope/spectrum/zoom/spectrogram views, persistence, control panel, main window
   firmware/        FX2 firmware (from Hantek6022API)
 ```
 
@@ -96,7 +108,7 @@ pyhantek/
 
 * The DDS120, ISDS-205B and MDSO models, which use different firmware and scaling
 * Writing calibration to the EEPROM, and the JSON export
-* Translations, the zoom view, and the histogram
+* Translations and the histogram
 
 ## Credits
 

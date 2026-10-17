@@ -7,9 +7,11 @@ import pyqtgraph as pg
 from PySide6.QtCore import QPointF, Qt, Signal
 from PySide6.QtGui import QFont
 
+from ..mathexpr import unit_for
 from ..processing import si_format
 from ..settings import CH_NAMES, DIVS_X, DIVS_Y, Settings
 from . import theme
+from .extra_views import BusLane, Phosphor
 
 pg.setConfigOptions(antialias=True, foreground=theme.TEXT, background=theme.SCREEN_BG)
 
@@ -29,6 +31,7 @@ class ScopeView(pg.PlotWidget):
     trigger_position_moved = Signal(float)  # 0..1
     offset_moved = Signal(int, float)  # trace (0, 1, 2=math), divisions
     wheel_steps = Signal(int, object)  # steps, keyboard modifiers
+    zoom_moved = Signal(float, float)  # region start/end in divisions
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -46,6 +49,25 @@ class ScopeView(pg.PlotWidget):
         self.vb.setBorder(_pen(theme.GRID_CENTER))
         self.setMinimumHeight(220)
         self._build_graticule()
+
+        self.phosphor = Phosphor(p)
+        self.phosphor.set_visible(False)
+        self.bus = BusLane(p)
+        self.xy_curve = pg.PlotDataItem(pen=_pen("#4ade80", 1.4), connect="finite")
+        self.xy_curve.setZValue(14)
+        self.xy_curve.setVisible(False)
+        p.addItem(self.xy_curve)
+        self.zoom_region = pg.LinearRegionItem(
+            (4, 6), brush=pg.mkBrush(79, 140, 255, 28), hoverBrush=pg.mkBrush(79, 140, 255, 50),
+            pen=_pen(theme.ACCENT, 1, alpha=160), bounds=(0, DIVS_X))
+        self.zoom_region.setZValue(3)
+        self.zoom_region.setVisible(False)
+        self.zoom_region.sigRegionChanged.connect(lambda r: self.zoom_moved.emit(*r.getRegion()))
+        p.addItem(self.zoom_region)
+        self.xy_label = pg.TextItem(anchor=(1, 1), color=theme.MUTED)
+        self.xy_label.setPos(DIVS_X - 0.1, -HY + 0.1)
+        self.xy_label.setZValue(30)
+        p.addItem(self.xy_label)
 
         self.curves = []
         for i in range(3):
@@ -174,31 +196,53 @@ class ScopeView(pg.PlotWidget):
 
     def apply_settings(self, s: Settings) -> None:
         self.settings = s
+        xy = s.xy_mode
         for i in range(2):
             ch = s.channels[i]
-            self.ground[i].setVisible(ch.enabled)
+            self.ground[i].setVisible(ch.enabled and not xy)
             if not self.ground[i].moving:
                 self.ground[i].setValue(ch.offset)
-        self.ground[2].setVisible(s.math_enabled)
+        self.ground[2].setVisible(s.math_enabled and not xy)
         if not self.ground[2].moving:
             self.ground[2].setValue(s.math_offset)
         t = s.trigger
         roll = t.mode == "Roll"
         src = s.channels[t.source]
         col = theme.CH_COLORS[t.source]
-        self.trig_level.setVisible(not roll and src.enabled)
+        self.trig_level.setVisible(not roll and src.enabled and not xy)
         self.trig_level.setPen(_pen(col, 1, Qt.DotLine, 110))
         self.trig_level.label.fill = pg.mkBrush(col)
         self.trig_level.label.update()
         if not self.trig_level.moving:
             self.trig_level.setValue(max(-HY, min(HY, t.level / src.vdiv + src.offset)))
-        self.trig_pos.setVisible(not roll)
+        self.trig_pos.setVisible(not roll and not xy)
         if not self.trig_pos.moving:
             self.trig_pos.setValue(t.position * DIVS_X)
         for c in self.cursors_x + self.cursors_y:
-            c.setVisible(s.cursors)
-        self.cursor_text.setVisible(s.cursors)
+            c.setVisible(s.cursors and not xy)
+        self.cursor_text.setVisible(s.cursors and not xy)
         self._update_cursor_text()
+        self.xy_curve.setVisible(xy)
+        self.xy_label.setText("XY  ·  X = CH1   Y = CH2" if xy else "")
+        for c in self.curves:
+            if xy:
+                c.setVisible(False)
+        self.zoom_region.setVisible(s.zoom_enabled and not xy)
+        if s.zoom_enabled and not self.zoom_region.mouseHovering:
+            self.zoom_region.blockSignals(True)
+            self.zoom_region.setRegion((s.zoom_start, s.zoom_end))
+            self.zoom_region.blockSignals(False)
+        if not (s.decoder.enabled and not xy):
+            self.bus.clear()
+
+    def set_xy(self, xy) -> None:
+        if xy is None:
+            self.xy_curve.setData([], [])
+        else:
+            self.xy_curve.setData(*xy)
+
+    def px_per_div(self) -> float:
+        return self.vb.width() / DIVS_X if self.vb.width() > 0 else 80.0
 
     def set_traces(self, traces, dots: bool = False) -> None:
         """traces: list of 3 entries, each (x_div, y_div) or None."""
@@ -251,7 +295,7 @@ class ScopeView(pg.PlotWidget):
             on = s.channels[i].enabled if i < 2 else s.math_enabled
             if on:
                 dv = abs(self._volts(yc, i) - self._volts(yd, i))
-                unit = "V²" if i == 2 and s.math_mode == 3 else "V"
+                unit = (unit_for(s.math_expr) or "u") if i == 2 else "V"
                 lines.append(f"ΔV{NAMES[i][-1] if i < 2 else 'M'}  {si_format(dv, unit):>10}")
         self.cursor_text.setText("\n".join(lines))
 
@@ -301,6 +345,25 @@ class SpectrumView(pg.PlotWidget):
         p.setLogMode(x=True, y=False)
         p.setYRange(-100, 20, padding=0)
         self.setMinimumHeight(140)
+        self.phosphor = Phosphor(p)
+        self.phosphor.set_visible(False)
+        self.bus = BusLane(p)
+        self.xy_curve = pg.PlotDataItem(pen=_pen("#4ade80", 1.4), connect="finite")
+        self.xy_curve.setZValue(14)
+        self.xy_curve.setVisible(False)
+        p.addItem(self.xy_curve)
+        self.zoom_region = pg.LinearRegionItem(
+            (4, 6), brush=pg.mkBrush(79, 140, 255, 28), hoverBrush=pg.mkBrush(79, 140, 255, 50),
+            pen=_pen(theme.ACCENT, 1, alpha=160), bounds=(0, DIVS_X))
+        self.zoom_region.setZValue(3)
+        self.zoom_region.setVisible(False)
+        self.zoom_region.sigRegionChanged.connect(lambda r: self.zoom_moved.emit(*r.getRegion()))
+        p.addItem(self.zoom_region)
+        self.xy_label = pg.TextItem(anchor=(1, 1), color=theme.MUTED)
+        self.xy_label.setPos(DIVS_X - 0.1, -HY + 0.1)
+        self.xy_label.setZValue(30)
+        p.addItem(self.xy_label)
+
         self.curves = []
         for i in range(3):
             c = p.plot(pen=_pen(theme.SPECTRUM_COLORS[i], 1.1))

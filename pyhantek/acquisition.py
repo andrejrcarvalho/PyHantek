@@ -226,10 +226,9 @@ class Acquisition(QThread):
                 scale = -scale
             out[ch] = (downsample(samples, rate.oversampling) - zero) * scale
             lsb[ch] = abs(scale)
-        if hw.channels == 2 and not s.channels[0].enabled and not s.math_enabled:
-            out[0] = None
-        if not s.channels[1].enabled and not s.math_enabled:
-            out[1] = None
+        for ch in range(2):
+            if not s.channel_needed(ch):
+                out[ch] = None
         return out, clipped, lsb
 
     def _capture_once(self) -> None:

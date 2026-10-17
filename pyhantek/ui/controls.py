@@ -15,16 +15,23 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from ..mathexpr import FUNCTIONS_HELP, PRESETS, MathError, compile_expr, label_for
+
 from ..models import ScopeModel
 from ..processing import si_format
 from ..settings import (
+    DECODE_FORMATS,
     INTERPOLATIONS,
-    MATH_MODES,
     NOISE_REJECT,
+    PERSISTENCE,
+    PROTOCOLS,
+    SPECTRUM_VIEWS,
     PROBES,
     TIMEBASES,
     TRIGGER_MODES,
@@ -249,6 +256,7 @@ class ChannelCard(Card):
 class ControlPanel(QScrollArea):
     changed = Signal()
     level_to_50 = Signal()
+    clear_persistence = Signal()
 
     def __init__(self, settings: Settings, model: ScopeModel, parent=None):
         super().__init__(parent)
@@ -310,10 +318,20 @@ class ControlPanel(QScrollArea):
         # --- math
         m = Card("Math", theme.CH_COLORS[2], toggle=True)
         self.math_card = m
-        self.math_mode = QComboBox()
-        self.math_mode.addItems(MATH_MODES)
-        m.row("Function", self.math_mode)
-        self.math_vdiv = Stepper([v for v in VDIVS] + [10.0, 20.0, 50.0], lambda v: si_format(v, "V") + "/div")
+        self.math_expr = QComboBox()
+        self.math_expr.setEditable(True)
+        self.math_expr.setInsertPolicy(QComboBox.NoInsert)
+        for label, expr, _ in PRESETS:
+            self.math_expr.addItem(label, expr)
+        self.math_expr.setToolTip("Pick a preset or type a formula and press Enter.\n\n" + FUNCTIONS_HELP)
+        m.row("Formula", self.math_expr)
+        self.math_error = QLabel("", objectName="Muted")
+        self.math_error.setWordWrap(True)
+        self.math_error.setStyleSheet(f"color:{theme.BAD};")
+        self.math_error.hide()
+        m.row("", self.math_error)
+        self.math_vdiv = Stepper([v for v in VDIVS] + [10.0, 20.0, 50.0, 100.0, 1e3, 1e4, 1e5],
+                                 lambda v: si_format(v, "") + "/div")
         m.row("Scale", self.math_vdiv)
         self.math_offset = QDoubleSpinBox(decimals=2, minimum=-4, maximum=4, singleStep=0.1, suffix=" div")
         m.row("Position", self.math_offset)
@@ -336,10 +354,102 @@ class ControlPanel(QScrollArea):
             cl.addWidget(b)
             self.spec_ch.append(b)
         sp.row("Show", chk)
+        self.spec_view = Segmented(SPECTRUM_VIEWS)
+        sp.row("View", self.spec_view)
+        self.sgram_ch = Segmented(["CH1", "CH2", "Math"])
+        sp.row("Waterfall", self.sgram_ch)
         self.lay.addWidget(sp)
+
+        # --- decoder
+        dc = Card("Decoder", toggle=True)
+        self.dec_card = dc
+        self.protocol = Segmented(["UART", "I²C", "SPI"])
+        dc.row("", self.protocol)
+        self.dec_stack = QStackedWidget()
+        # UART page
+        up = QWidget()
+        ug = QGridLayout(up)
+        ug.setContentsMargins(0, 0, 0, 0)
+        ug.setColumnStretch(1, 1)
+        self.uart_ch = Segmented(["CH1", "CH2"])
+        self.uart_baud = QComboBox()
+        self.uart_baud.setEditable(True)
+        self.uart_baud.addItem("Auto", 0.0)
+        for b in (1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600):
+            self.uart_baud.addItem(str(b), float(b))
+        self.uart_bits = QSpinBox(minimum=5, maximum=9, value=8)
+        self.uart_parity = Segmented(["None", "Even", "Odd"])
+        self.uart_stop = Segmented(["1", "1.5", "2"])
+        self.uart_inv = QCheckBox("Inverted (RS-232)")
+        for r, (lbl, w) in enumerate([("Line", self.uart_ch), ("Baud", self.uart_baud), ("Data bits", self.uart_bits),
+                                       ("Parity", self.uart_parity), ("Stop bits", self.uart_stop), ("", self.uart_inv)]):
+            if lbl:
+                ug.addWidget(QLabel(lbl, objectName="Muted"), r, 0)
+                ug.addWidget(w, r, 1)
+            else:
+                ug.addWidget(w, r, 0, 1, 2)
+        self.dec_stack.addWidget(up)
+        # I2C page
+        ip = QWidget()
+        ig = QGridLayout(ip)
+        ig.setContentsMargins(0, 0, 0, 0)
+        ig.setColumnStretch(1, 1)
+        self.i2c_scl = Segmented(["CH1", "CH2"])
+        ig.addWidget(QLabel("SCL", objectName="Muted"), 0, 0)
+        ig.addWidget(self.i2c_scl, 0, 1)
+        note = QLabel("SDA is the other channel", objectName="Muted")
+        note.setWordWrap(True)
+        ig.addWidget(note, 1, 0, 1, 2)
+        self.dec_stack.addWidget(ip)
+        # SPI page
+        pp = QWidget()
+        pg_ = QGridLayout(pp)
+        pg_.setContentsMargins(0, 0, 0, 0)
+        pg_.setColumnStretch(1, 1)
+        self.spi_clk = Segmented(["CH1", "CH2"])
+        self.spi_edge = Segmented(["Rising", "Falling"])
+        self.spi_bits = QSpinBox(minimum=4, maximum=32, value=8)
+        self.spi_order = Segmented(["MSB", "LSB"])
+        for r, (lbl, w) in enumerate([("CLK", self.spi_clk), ("Sample on", self.spi_edge), ("Word bits", self.spi_bits),
+                                       ("Bit order", self.spi_order)]):
+            pg_.addWidget(QLabel(lbl, objectName="Muted"), r, 0)
+            pg_.addWidget(w, r, 1)
+        note = QLabel("Data is the other channel. Words are framed by gaps in the clock.", objectName="Muted")
+        note.setWordWrap(True)
+        pg_.addWidget(note, 4, 0, 1, 2)
+        self.dec_stack.addWidget(pp)
+        dc.row("", self.dec_stack)
+        thr = QWidget()
+        tl = QHBoxLayout(thr)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(4)
+        self.thr_auto = QCheckBox("Auto")
+        self.thr = QDoubleSpinBox(decimals=2, minimum=-50, maximum=50, singleStep=0.1, suffix=" V")
+        tl.addWidget(self.thr_auto)
+        tl.addWidget(self.thr, 1)
+        dc.row("Threshold", thr)
+        self.dec_fmt = Segmented(DECODE_FORMATS)
+        dc.row("Format", self.dec_fmt)
+        self.lay.addWidget(dc)
 
         # --- display
         d = Card("Display")
+        self.xy = Segmented(["YT", "XY"], tooltips=["Voltage over time", "CH2 against CH1 (Lissajous)"])
+        d.row("Mode", self.xy)
+        pers = QWidget()
+        pl = QHBoxLayout(pers)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pl.setSpacing(4)
+        self.persist = QComboBox()
+        self.persist.addItems(["Off" if p == 0 else "Infinite" if p < 0 else f"{p:g} s" for p in PERSISTENCE])
+        self.persist.setToolTip("Keep fading copies of older traces on screen (like an analog phosphor)")
+        clear = QPushButton("Clear")
+        pl.addWidget(self.persist, 1)
+        pl.addWidget(clear)
+        d.row("Persistence", pers)
+        self.zoom = QCheckBox("Zoom window")
+        self.zoom.setToolTip("Drag the shaded region on the screen to choose what to magnify")
+        d.row("", self.zoom)
         self.interp = QComboBox()
         self.interp.addItems(INTERPOLATIONS)
         d.row("Drawing", self.interp)
@@ -366,7 +476,8 @@ class ControlPanel(QScrollArea):
         b50.clicked.connect(self.level_to_50.emit)
         self.noise.currentIndexChanged.connect(lambda i: self._set(settings.trigger, "noise_reject", i))
         m.toggle.toggled.connect(lambda v: self._set(settings, "math_enabled", v))
-        self.math_mode.currentIndexChanged.connect(lambda i: self._set(settings, "math_mode", i))
+        self.math_expr.activated.connect(self._on_math_preset)
+        self.math_expr.lineEdit().editingFinished.connect(self._on_math_typed)
         self.math_vdiv.changed.connect(lambda v: self._set(settings, "math_vdiv", v))
         self.math_offset.valueChanged.connect(lambda v: self._set(settings, "math_offset", v))
         sp.toggle.toggled.connect(lambda v: self._set(settings, "spectrum_enabled", v))
@@ -374,6 +485,31 @@ class ControlPanel(QScrollArea):
         for i, b in enumerate(self.spec_ch):
             b.toggled.connect(lambda v, i=i: self._set_spec(i, v))
         self.interp.currentTextChanged.connect(lambda v: self._set(settings, "interpolation", v))
+        self.xy.changed.connect(lambda i: self._set(settings, "xy_mode", i == 1))
+        self.persist.currentIndexChanged.connect(lambda i: self._set(settings, "persistence", PERSISTENCE[i]))
+        clear.clicked.connect(self.clear_persistence.emit)
+        self.zoom.toggled.connect(lambda v: self._set(settings, "zoom_enabled", v))
+        self.spec_view.changed.connect(lambda i: self._set(settings, "spectrum_view", SPECTRUM_VIEWS[i]))
+        self.sgram_ch.changed.connect(lambda i: self._set(settings, "spectrogram_channel", i))
+        dcs = settings.decoder
+        dc.toggle.toggled.connect(lambda v: self._set(self.settings.decoder, "enabled", v))
+        self.protocol.changed.connect(self._on_protocol)
+        self.uart_ch.changed.connect(lambda i: self._set(self.settings.decoder, "uart_channel", i))
+        self.uart_baud.activated.connect(lambda i: self._set(self.settings.decoder, "uart_baud", float(self.uart_baud.itemData(i) or 0)))
+        self.uart_baud.lineEdit().editingFinished.connect(self._on_baud_typed)
+        self.uart_bits.valueChanged.connect(lambda v: self._set(self.settings.decoder, "uart_bits", v))
+        self.uart_parity.changed.connect(lambda i: self._set(self.settings.decoder, "uart_parity", ["None", "Even", "Odd"][i]))
+        self.uart_stop.changed.connect(lambda i: self._set(self.settings.decoder, "uart_stop", [1, 1.5, 2][i]))
+        self.uart_inv.toggled.connect(lambda v: self._set(self.settings.decoder, "uart_inverted", v))
+        self.i2c_scl.changed.connect(lambda i: self._set(self.settings.decoder, "clock_channel", i))
+        self.spi_clk.changed.connect(lambda i: self._set(self.settings.decoder, "clock_channel", i))
+        self.spi_edge.changed.connect(lambda i: self._set(self.settings.decoder, "spi_edge", ["Rising", "Falling"][i]))
+        self.spi_bits.valueChanged.connect(lambda v: self._set(self.settings.decoder, "spi_bits", v))
+        self.spi_order.changed.connect(lambda i: self._set(self.settings.decoder, "spi_msb_first", i == 0))
+        self.thr_auto.toggled.connect(self._on_thr_auto)
+        self.thr.valueChanged.connect(lambda v: self._set(self.settings.decoder, "threshold", v))
+        self.dec_fmt.changed.connect(lambda i: self._set(self.settings.decoder, "format", DECODE_FORMATS[i]))
+        del dcs
         self.avg.currentIndexChanged.connect(lambda i: self._set(settings, "averaging", [1, 2, 4, 8, 16, 32][i]))
         self.cursors.toggled.connect(lambda v: self._set(settings, "cursors", v))
         self.calfreq.currentIndexChanged.connect(lambda i: self._set(settings, "calfreq", float(model.cal_frequencies[i])))
@@ -388,6 +524,48 @@ class ControlPanel(QScrollArea):
         if getattr(obj, name) != value:
             setattr(obj, name, value)
             self.changed.emit()
+
+    def _on_math_preset(self, i):
+        expr = self.math_expr.itemData(i)
+        if expr:
+            self.math_error.hide()
+            self._set(self.settings, "math_expr", expr)
+
+    def _on_math_typed(self):
+        text = self.math_expr.currentText().strip()
+        i = self.math_expr.findText(text)
+        expr = self.math_expr.itemData(i) if i >= 0 else text
+        try:
+            compile_expr(expr)
+        except MathError as exc:
+            self.math_error.setText(str(exc))
+            self.math_error.show()
+            return
+        self.math_error.hide()
+        self._set(self.settings, "math_expr", expr)
+
+    def _on_protocol(self, i):
+        self.dec_stack.setCurrentIndex(i)
+        self._set(self.settings.decoder, "protocol", PROTOCOLS[i])
+        self._sync_clock_widgets()
+
+    def _sync_clock_widgets(self):
+        for w in (self.i2c_scl, self.spi_clk):
+            w.blockSignals(True)
+            w.set_index(self.settings.decoder.clock_channel)
+            w.blockSignals(False)
+
+    def _on_baud_typed(self):
+        text = self.uart_baud.currentText().strip().lower()
+        try:
+            baud = 0.0 if text in ("", "auto") else float(text.replace("k", "e3"))
+        except ValueError:
+            return
+        self._set(self.settings.decoder, "uart_baud", baud)
+
+    def _on_thr_auto(self, on):
+        self.thr.setEnabled(not on)
+        self._set(self.settings.decoder, "threshold_auto", on)
 
     def _set_spec(self, i, v):
         self.settings.spectrum_channels[i] = v
@@ -422,8 +600,12 @@ class ControlPanel(QScrollArea):
         """Update all widgets from the settings object."""
         s = self.settings
         widgets = [self.timebase, self.trig_mode, self.trig_src, self.trig_slope, self.trig_level, self.noise,
-                   self.math_card.toggle, self.math_mode, self.math_vdiv, self.math_offset, self.spec_card.toggle,
-                   self.window, self.interp, self.avg, self.cursors, self.calfreq, *self.spec_ch]
+                   self.math_card.toggle, self.math_expr, self.math_vdiv, self.math_offset, self.spec_card.toggle,
+                   self.window, self.interp, self.avg, self.cursors, self.calfreq, *self.spec_ch,
+                   self.xy, self.persist, self.zoom, self.spec_view, self.sgram_ch, self.dec_card.toggle,
+                   self.protocol, self.uart_ch, self.uart_baud, self.uart_bits, self.uart_parity, self.uart_stop,
+                   self.uart_inv, self.i2c_scl, self.spi_clk, self.spi_edge, self.spi_bits, self.spi_order,
+                   self.thr_auto, self.thr, self.dec_fmt]
         for w in widgets:
             w.blockSignals(True)
         self.timebase.set_value(s.timebase)
@@ -435,7 +617,11 @@ class ControlPanel(QScrollArea):
         self.noise.setCurrentIndex(s.trigger.noise_reject)
         self.math_card.toggle.setChecked(s.math_enabled)
         self.math_card.body.setEnabled(s.math_enabled)
-        self.math_mode.setCurrentIndex(s.math_mode)
+        i = self.math_expr.findData(s.math_expr)
+        if i >= 0:
+            self.math_expr.setCurrentIndex(i)
+        else:
+            self.math_expr.setEditText(label_for(s.math_expr))
         self.math_vdiv.set_value(s.math_vdiv)
         self.math_offset.setValue(s.math_offset)
         self.spec_card.toggle.setChecked(s.spectrum_enabled)
@@ -446,6 +632,36 @@ class ControlPanel(QScrollArea):
         self.interp.setCurrentText(s.interpolation)
         self.avg.setCurrentIndex([1, 2, 4, 8, 16, 32].index(s.averaging) if s.averaging in (1, 2, 4, 8, 16, 32) else 0)
         self.cursors.setChecked(s.cursors)
+        self.xy.set_index(1 if s.xy_mode else 0)
+        self.persist.setCurrentIndex(PERSISTENCE.index(s.persistence) if s.persistence in PERSISTENCE else 0)
+        self.zoom.setChecked(s.zoom_enabled)
+        self.spec_view.set_index(SPECTRUM_VIEWS.index(s.spectrum_view) if s.spectrum_view in SPECTRUM_VIEWS else 0)
+        self.sgram_ch.set_index(s.spectrogram_channel)
+        d = s.decoder
+        self.dec_card.toggle.setChecked(d.enabled)
+        self.dec_card.body.setEnabled(d.enabled)
+        pi = PROTOCOLS.index(d.protocol) if d.protocol in PROTOCOLS else 0
+        self.protocol.set_index(pi)
+        self.dec_stack.setCurrentIndex(pi)
+        self.uart_ch.set_index(d.uart_channel)
+        bi = self.uart_baud.findData(float(d.uart_baud))
+        if bi >= 0:
+            self.uart_baud.setCurrentIndex(bi)
+        else:
+            self.uart_baud.setEditText(f"{d.uart_baud:g}")
+        self.uart_bits.setValue(d.uart_bits)
+        self.uart_parity.set_index(["None", "Even", "Odd"].index(d.uart_parity) if d.uart_parity in ("None", "Even", "Odd") else 0)
+        self.uart_stop.set_index({1: 0, 1.5: 1, 2: 2}.get(d.uart_stop, 0))
+        self.uart_inv.setChecked(d.uart_inverted)
+        self.i2c_scl.set_index(d.clock_channel)
+        self.spi_clk.set_index(d.clock_channel)
+        self.spi_edge.set_index(0 if d.spi_edge == "Rising" else 1)
+        self.spi_bits.setValue(d.spi_bits)
+        self.spi_order.set_index(0 if d.spi_msb_first else 1)
+        self.thr_auto.setChecked(d.threshold_auto)
+        self.thr.setEnabled(not d.threshold_auto)
+        self.thr.setValue(d.threshold)
+        self.dec_fmt.set_index(DECODE_FORMATS.index(d.format) if d.format in DECODE_FORMATS else 0)
         freqs = list(self.model.cal_frequencies)
         self.calfreq.setCurrentIndex(min(range(len(freqs)), key=lambda k: abs(freqs[k] - s.calfreq)))
         for w in widgets:
