@@ -43,6 +43,8 @@ PyInstaller can't cross-compile, so the `.exe` and `.msi` have to be built on Wi
 
 The `.deb` (`sudo apt install ./pyhantek_*.deb`) installs the app to `/opt/pyhantek`, a `pyhantek` command, the applications-menu entry and the udev rule, so USB access works after replugging the scope. The `.msi` installs to `Program Files\PyHantek` and adds Start menu and desktop shortcuts.
 
+**Windows Smart App Control:** the Windows builds aren't code-signed yet. If Smart App Control is on (Windows Security > App & browser control), Windows blocks the bundled NumPy/Python DLLs. The app then fails at startup, either with a "Smart App Control" message or, in older builds, with "Importing the numpy C-extensions failed". Blocked files show up in Event Viewer under *Applications and Services Logs > Microsoft > Windows > CodeIntegrity > Operational*. To fix it, turn Smart App Control off or run from source (`uv run pyhantek`). Code-signing the builds would make this go away.
+
 To run the AppImage: `chmod +x PyHantek-*.AppImage && ./PyHantek-*.AppImage`. It needs a distro with a glibc at least as new as the build machine's (Ubuntu 22.04 for CI builds). For USB access, install the udev rule once:
 `./PyHantek-*.AppImage --udev-rules | sudo tee /etc/udev/rules.d/60-openhantek.rules && sudo udevadm control --reload`
 
